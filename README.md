@@ -23,12 +23,21 @@ hour. Hover any column for its own numbers; `u` switches units, `r` refetches.
 
 ## What it measures
 
-Desk distance, not screen distance. The tracker reads relative motion straight
-off the kernel's evdev devices, which is the raw stream *before* libinput's
-pointer acceleration — so 400 counts on a 1000 DPI mouse is 1 cm of desk your
-hand really crossed, whatever the cursor did on screen. That is the number
-worth shrinking: the cursor crossing three ultrawides costs your shoulder
-nothing extra if you flicked it there.
+Desk distance, not screen distance. The tracker reads motion straight off the
+kernel's evdev devices, which is the raw stream *before* libinput's pointer
+acceleration — so 400 counts on a 1000 DPI mouse is 1 cm of desk your hand
+really crossed, whatever the cursor did on screen. That is the number worth
+shrinking: the cursor crossing three ultrawides costs your shoulder nothing
+extra if you flicked it there.
+
+Touchpads count too. A mouse says how far it moved and a pad says where the
+finger is, but they are two transducers for one act — a hand moving — so the
+pad's positions are turned into the deltas a mouse would have sent and
+everything downstream stays ignorant of the difference. Only the primary
+finger contributes distance, because a two-finger scroll is still one hand;
+a finger lifting and landing elsewhere contributes nothing, because your hand
+did not travel that line. Two-finger scrolling is counted as scroll instead,
+at 10 mm to the detent, so the column means the same thing on both.
 
 Distance is summed per input report (usually 1000 a second), so a curved sweep
 is measured along its curve rather than corner to corner.
@@ -67,6 +76,12 @@ state and config files, and no sudoers rule is touched. Set `autostart` to
 panel has a **Start tracker** button, and `install.sh` does the same job. To
 undo all of it, see [Uninstall](#uninstall).
 
+On a laptop, note that a Windows Precision Touchpad publishes two evdev nodes
+— the pad, and a relative "Mouse" collection kept for firmware older than the
+standard. In precision mode, which is to say on every Linux machine, that
+second node never emits an event. The pad speaks for the hardware and the
+compat node is ignored, so `devices` lists one device, not two.
+
 Reading the mouse needs membership in the `input` group and nothing more — no
 root, no compositor hooks. If `id -nG` does not list `input`:
 
@@ -94,6 +109,7 @@ omarchy-mouse-odometer detect
 | **calibrated** | What you measured here. Beats everything else. |
 | **hardware** | Read live from the mouse via `libratbag`, if installed. The only source that survives a DPI-button press. |
 | **hwdb** | udev's mouse database, which ships a factory DPI for a few hundred known models. Free and automatic. |
+| **the pad's own scale** | A touchpad reports its resolution in units per millimetre, because the hardware knows how big its glass is. Exact, automatic, and the reason a laptop never needs calibrating. |
 | **assumed** | Nothing knows, so 1000 is used and the CLI says so. |
 
 `omarchy-mouse-odometer devices` names the source it is using, and `status`

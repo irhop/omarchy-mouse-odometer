@@ -18,8 +18,10 @@ Membership in the `input` group is enough to read the devices; no root.
 
 import argparse
 import statistics
+import collections
 import datetime as dt
 import errno
+import fcntl
 import json
 import math
 import os
@@ -31,12 +33,24 @@ import time
 
 # struct input_event { struct timeval time; __u16 type, code; __s32 value; }
 EVENT = struct.Struct("llHHi")
-EV_KEY, EV_REL = 0x01, 0x02
+EV_KEY, EV_REL, EV_ABS = 0x01, 0x02, 0x03
 EV_SYN, SYN_REPORT = 0x00, 0x00
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
+ABS_X, ABS_Y = 0x00, 0x01
+ABS_MT_SLOT, ABS_MT_POSITION_X = 0x2f, 0x35
+ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x36, 0x39
 BTN_FIRST, BTN_LAST = 0x110, 0x117  # BTN_LEFT .. BTN_TASK
+BTN_TOUCH = 0x14a
+INPUT_PROP_POINTER = 0   # drives a cursor somewhere else: a pad, not a screen
+INPUT_PROP_DIRECT = 1    # the finger is on the picture: a touchscreen, not a pad
+INPUT_PROP_BUTTONPAD = 2
+
+# EVIOCGABS(axis) is _IOR('E', 0x40 + axis, struct input_absinfo), and the
+# struct is six int32s: value, minimum, maximum, fuzz, flat, resolution.
+ABSINFO = struct.Struct("6i")
 
 INCH_M = 0.0254
+MM_INCH = 25.4
 DEFAULT_DPI = 1000
 RESCAN_SECONDS = 5.0     # catch a mouse being plugged in or waking up
 FLUSH_SECONDS = 15.0     # how often a dirty state file is written
@@ -45,8 +59,13 @@ DPI_SOURCE_LABEL = {
     "calibrated": "measured here",
     "hardware": "read from the mouse",
     "hwdb": "from udev's mouse database",
+    "touchpad": "the pad's own scale",
     "default": "assumed \u2014 not calibrated",
 }
+# Two fingers travelling together is a scroll, and a pad reports no wheel of
+# its own. Ten millimetres is roughly what one detent moves a page, so it is
+# the fairest way to put a gesture and a wheel in the same column.
+SCROLL_TICK_MM = 10.0
 AXIS_TOLERANCE = 0.03
 # No mouse made runs below this or above this. A reading outside the range is
 # not a slow sensor, it is a drag that never happened at the stated distance —
@@ -70,10 +89,32 @@ CONFIG_PATH = os.path.join(
 
 # ---------------------------------------------------------------- discovery
 
+Pointer = collections.namedtuple("Pointer", "name path kind has_mt phys")
+
+
+def low_bits(line):
+    """The low 64 bits of a /proc bitmask.
+
+    Multi-word masks print most-significant word first, so every bit this file
+    cares about — REL_X through ABS_MT_TRACKING_ID — lives in the last word.
+    """
+    words = line.split("=", 1)[1].split()
+    return int(words[-1], 16) if words else 0
+
+
 def pointer_devices():
-    """Every device reporting relative X *and* Y — a mouse, trackball or trackpoint.
+    """Every device that measures a hand moving: mice, trackballs, trackpoints
+    and touchpads.
+
+    A mouse says how far it moved; a touchpad says where the finger is. They
+    are different transducers for the same physical act, so both are tracked,
+    and the difference is confined to `Tracker.settle` — which turns a position
+    into the delta a mouse would have reported, before anything downstream can
+    tell them apart.
 
     Keyboards with a scroll wheel report REL too, so both axes are required.
+    Touchscreens and tablets report ABS but set INPUT_PROP_DIRECT, and a finger
+    on a picture is not a hand crossing a desk, so they are left out.
     """
     found = []
     try:
@@ -83,30 +124,82 @@ def pointer_devices():
         return found
 
     for block in blob.split("\n\n"):
-        name, handlers, rel = "", [], 0
+        name, handlers, rel, absolute, props, phys = "", [], 0, 0, 0, ""
         for line in block.splitlines():
             if line.startswith("N: Name="):
                 name = line.split("=", 1)[1].strip().strip('"').strip()
+            elif line.startswith("P: Phys="):
+                phys = line.split("=", 1)[1].strip()
             elif line.startswith("H: Handlers="):
                 handlers = line.split("=", 1)[1].split()
             elif line.startswith("B: REL="):
-                # Multi-word masks print most-significant first, so bits 0-63
-                # (REL_X, REL_Y) always live in the last word.
-                words = line.split("=", 1)[1].split()
-                rel = int(words[-1], 16) if words else 0
-        if rel & 0b11 != 0b11:
+                rel = low_bits(line)
+            elif line.startswith("B: ABS="):
+                absolute = low_bits(line)
+            elif line.startswith("B: PROP="):
+                props = low_bits(line)
+
+        if rel & 0b11 == 0b11:
+            kind, has_mt = "rel", False
+        elif (absolute & 0b11 == 0b11
+              and not props & (1 << INPUT_PROP_DIRECT)
+              and (absolute & (1 << ABS_MT_TRACKING_ID)
+                   or props & ((1 << INPUT_PROP_POINTER) | (1 << INPUT_PROP_BUTTONPAD)))):
+            # Absolute *and* pad-shaped. The extra test is what keeps a device
+            # that merely happens to carry an ABS collection — some mice and
+            # remotes do — from being read as a touchpad and counted twice.
+            kind, has_mt = "abs", bool(absolute & (1 << ABS_MT_TRACKING_ID))
+        else:
             continue
+
         for handler in handlers:
             if handler.startswith("event"):
-                found.append((name or handler, "/dev/input/" + handler))
+                found.append(Pointer(name or handler, "/dev/input/" + handler,
+                                     kind, has_mt, phys))
                 break
-    return found
+
+    # A Windows Precision Touchpad exposes two nodes on one Phys: the pad, and
+    # a relative "Mouse" collection kept for firmware that predates it. In
+    # precision mode — which is every Linux machine — that second node is
+    # silent, so watching it means watching nothing and reporting a mouse
+    # nobody owns. The pad speaks for the hardware; the compat node yields.
+    pads = set(p.phys for p in found if p.kind == "abs" and p.phys)
+    return [p for p in found if not (p.kind == "rel" and p.phys in pads)]
+
+
+def abs_scale(path):
+    """A touchpad's own scale, in counts per inch, straight from the kernel.
+
+    Touchpads report `resolution` in units per millimetre because the hardware
+    knows how big its own glass is. That makes a pad the one pointer on the
+    system that needs no calibration and no guess — the figure is a fact about
+    the device, not a setting. None when the pad declines to say.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        scale = []
+        for axis in (ABS_X, ABS_Y):
+            buffer = bytearray(ABSINFO.size)
+            request = (2 << 30) | (ABSINFO.size << 16) | (ord("E") << 8) | (0x40 + axis)
+            fcntl.ioctl(fd, request, buffer)
+            resolution = ABSINFO.unpack(bytes(buffer))[5]
+            if resolution <= 0:
+                return None
+            scale.append(resolution * MM_INCH)
+        return tuple(scale)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 class Device:
     """One open evdev node, with the deltas of the report being assembled."""
 
-    def __init__(self, name, path, fd, dpi, source="default"):
+    def __init__(self, name, path, fd, dpi, source="default", kind="rel", has_mt=False):
         self.name = name
         self.path = path
         self.fd = fd
@@ -114,6 +207,22 @@ class Device:
         self.dpi_x, self.dpi_y = dpi if isinstance(dpi, tuple) else (dpi, dpi)
         self.dx = 0
         self.dy = 0
+
+        # Absolute pads only. `contacts` is slot -> [x, y, tracking id];
+        # `anchor` is where the primary finger sat at the last report, which is
+        # what a position has to be subtracted from to become a movement.
+        self.kind = kind
+        self.has_mt = has_mt
+        self.slot = 0
+        self.contacts = {}
+        self.anchor = None
+        self.touches = 0
+        # A detent's worth of gesture, in the pad's own integer units. Counting
+        # in units rather than millimetres keeps the arithmetic exact: a scroll
+        # of precisely two detents must not come out as one because the
+        # conversion landed a fraction of a micron short.
+        self.scroll_units = 0
+        self.scroll_tick = max(1, int(round(SCROLL_TICK_MM * self.dpi_y / MM_INCH)))
 
     @property
     def dpi(self):
@@ -230,15 +339,23 @@ def configured_dpi(config, name):
     return None
 
 
-def dpi_for(config, name, path=None):
+def dpi_for(config, name, path=None, kind="rel"):
     """Resolve a device's DPI and say where the number came from.
 
     Order matters: a calibration the user measured beats the hardware's own
-    claim, which beats a factory figure from udev, which beats a guess.
+    claim, which beats a factory figure from udev, which beats a guess. A
+    touchpad's scale sits just under the calibration, because it is measured
+    too — at the factory, by the people who cut the glass — and none of the
+    mouse-shaped sources below know the first thing about it.
     """
     pinned = configured_dpi(config, name)
     if pinned:
         return pinned, "calibrated"
+
+    if kind == "abs" and path:
+        glass = abs_scale(path)
+        if glass:
+            return glass, "touchpad"
 
     live = ratbag_dpi(name)
     if live:
@@ -405,7 +522,8 @@ class Tracker:
 
     def rescan(self):
         live = {}
-        for name, path in pointer_devices():
+        for pointer in pointer_devices():
+            name, path = pointer.name, pointer.path
             live[path] = name
             if path in self.devices:
                 continue
@@ -415,8 +533,8 @@ class Tracker:
                 if error.errno not in (errno.EACCES, errno.ENOENT):
                     print("mouse-odometer: %s: %s" % (path, error), file=sys.stderr)
                 continue
-            dpi, source = dpi_for(self.config, name, path)
-            self.devices[path] = Device(name, path, fd, dpi, source)
+            dpi, source = dpi_for(self.config, name, path, pointer.kind)
+            self.devices[path] = Device(name, path, fd, dpi, source, pointer.kind, pointer.has_mt)
             device = self.devices[path]
             resolution = ("%g dpi" % device.dpi_x if device.dpi_x == device.dpi_y
                           else "%g x %g dpi" % (device.dpi_x, device.dpi_y))
@@ -459,11 +577,80 @@ class Tracker:
                     # Only the coarse wheel axes; the HI_RES twins would
                     # double-count the same physical detent.
                     self.tally(seconds, device, "scrolls", abs(value))
+            elif kind == EV_ABS and device.kind == "abs":
+                self.absorb(device, code, value)
+            elif kind == EV_KEY and code == BTN_TOUCH and device.kind == "abs":
+                # Pads that predate multitouch report one finger through
+                # ABS_X/ABS_Y, with BTN_TOUCH as the only word on whether it is
+                # down. Standing in a tracking id keeps the lift-and-reland
+                # guard below working the same on both generations.
+                if not device.has_mt:
+                    device.touches += 1
+                    if value:
+                        device.contacts[0] = [None, None, device.touches]
+                    else:
+                        device.contacts.pop(0, None)
             elif kind == EV_KEY and BTN_FIRST <= code <= BTN_LAST and value == 1:
                 self.tally(seconds, device, "clicks", 1)
             elif kind == EV_SYN and code == SYN_REPORT:
+                if device.kind == "abs":
+                    self.settle(device, seconds)
                 self.commit(device, seconds)
         return True
+
+    def absorb(self, device, code, value):
+        """Stash one absolute axis. Positions do not become movement until
+        SYN_REPORT, when the whole report — every finger in it — is known."""
+        if code == ABS_MT_SLOT:
+            device.slot = value
+        elif code == ABS_MT_TRACKING_ID:
+            if value == -1:
+                device.contacts.pop(device.slot, None)
+            else:
+                device.contacts.setdefault(device.slot, [None, None, value])[2] = value
+        elif code == ABS_MT_POSITION_X:
+            device.contacts.setdefault(device.slot, [None, None, 0])[0] = value
+        elif code == ABS_MT_POSITION_Y:
+            device.contacts.setdefault(device.slot, [None, None, 0])[1] = value
+        elif not device.has_mt and code == ABS_X:
+            device.contacts.setdefault(0, [None, None, 0])[0] = value
+        elif not device.has_mt and code == ABS_Y:
+            device.contacts.setdefault(0, [None, None, 0])[1] = value
+
+    def settle(self, device, seconds):
+        """Turn this report's finger positions into the delta a mouse would
+        have sent, so that everything downstream can stay ignorant of the
+        difference.
+
+        Only the primary contact — the lowest live slot — contributes distance.
+        A two-finger scroll is one hand moving, and adding both fingers up
+        would claim the hand went twice as far as it did.
+        """
+        live = {slot: contact for slot, contact in device.contacts.items()
+                if contact[0] is not None and contact[1] is not None}
+        if not live:
+            device.anchor = None
+            device.scroll_units = 0
+            return
+
+        slot = min(live)
+        x, y, track = live[slot]
+        anchor, device.anchor = device.anchor, (slot, track, x, y)
+
+        # A finger that has just landed has not travelled yet. Without this the
+        # jump from wherever the last one lifted would be recorded as a swipe
+        # across the whole pad, several times a minute.
+        if not anchor or anchor[0] != slot or anchor[1] != track:
+            return
+
+        device.dx += x - anchor[2]
+        device.dy += y - anchor[3]
+
+        if len(live) == 2:
+            device.scroll_units += abs(y - anchor[3])
+            ticks, device.scroll_units = divmod(device.scroll_units, device.scroll_tick)
+            if ticks:
+                self.tally(seconds, device, "scrolls", ticks)
 
     def commit(self, device, seconds):
         """One SYN_REPORT of motion: add its straight-line hop to the path."""
@@ -645,8 +832,9 @@ def cmd_devices(_args):
         print("No pointer devices found.")
         return 1
     uncalibrated = False
-    for name, path in devices:
-        (dpi_x, dpi_y), source = dpi_for(config, name, path)
+    for pointer in devices:
+        name, path = pointer.name, pointer.path
+        (dpi_x, dpi_y), source = dpi_for(config, name, path, pointer.kind)
         resolution = "%g dpi" % dpi_x if dpi_x == dpi_y else "%g x %g dpi" % (dpi_x, dpi_y)
         readable = "" if os.access(path, os.R_OK) else "  [NOT READABLE — add yourself to the `input` group]"
         print("%-30s %-18s %-14s %s%s"
@@ -665,15 +853,20 @@ def cmd_devices(_args):
 def cmd_detect(_args):
     """Show what each source knows, so a wrong number can be traced."""
     config = load_config()
-    for name, path in pointer_devices():
-        print(name)
+    for pointer in pointer_devices():
+        name, path = pointer.name, pointer.path
+        print("%s%s" % (name, "  (touchpad)" if pointer.kind == "abs" else ""))
+        glass = abs_scale(path) if pointer.kind == "abs" else None
+        if pointer.kind == "abs":
+            print("  pad scale   %s" % (("%g x %g dpi, from the pad itself" % glass) if glass
+                                        else "the pad does not report its resolution"))
         print("  udev hwdb   %s" % (("%g dpi" % hwdb_dpi(path)) if hwdb_dpi(path) else "nothing recorded"))
         live = ratbag_dpi(name)
         print("  hardware    %s" % (("%g dpi" % live) if live
                                     else "no libratbag support (install libratbag for gaming mice)"))
         pinned = configured_dpi(config, name)
         print("  calibrated  %s" % (("%g x %g dpi" % pinned) if pinned else "not measured yet"))
-        (dpi_x, dpi_y), source = dpi_for(config, name, path)
+        (dpi_x, dpi_y), source = dpi_for(config, name, path, pointer.kind)
         print("  -> using    %g dpi (%s)" % (dpi_x, DPI_SOURCE_LABEL.get(source, source)))
     return 0
 
@@ -763,11 +956,22 @@ def calibrate_axis(fd, axis, distance_cm, passes):
 def cmd_calibrate(args):
     devices = pointer_devices()
     if args.device:
-        devices = [d for d in devices if args.device.lower() in d[0].lower() or args.device in d[1]]
+        devices = [d for d in devices
+                   if args.device.lower() in d.name.lower() or args.device in d.path]
     if not devices:
         print("No matching pointer device.", file=sys.stderr)
         return 1
-    name, path = devices[0]
+
+    # A ruler is for mice. Prefer one even when a pad is listed first, and say
+    # so rather than walk someone through measuring a number the kernel knows.
+    pointer = next((d for d in devices if d.kind == "rel"), devices[0])
+    if pointer.kind == "abs":
+        print("%s is a touchpad: it reports its own scale, so there is nothing"
+              % pointer.name, file=sys.stderr)
+        print("to calibrate. `omarchy-mouse-odometer detect` shows the figure it uses.",
+              file=sys.stderr)
+        return 1
+    name, path = pointer.name, pointer.path
 
     axes = ["x", "y"] if args.axis == "both" else [args.axis]
     print("Calibrating: %s" % name)
