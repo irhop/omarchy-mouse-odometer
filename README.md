@@ -74,10 +74,36 @@ root, no compositor hooks. If `id -nG` does not list `input`:
 sudo usermod -aG input "$USER"    # then log out and back in
 ```
 
+## DPI, and why it is not a prerequisite
+
+Distance is counts divided by DPI, so the figure matters — but only for the
+*absolute* numbers. DPI is a constant scale factor, so every comparison the
+plugin makes (today against your baseline, this week against last, streaks,
+the progress score) is completely unaffected by getting it wrong. That is why
+the plugin starts counting immediately rather than holding your data hostage
+until you find a ruler.
+
+It works the figure out for itself where it can:
+
+```bash
+omarchy-mouse-odometer detect
+```
+
+| Source | What it is |
+|---|---|
+| **calibrated** | What you measured here. Beats everything else. |
+| **hardware** | Read live from the mouse via `libratbag`, if installed. The only source that survives a DPI-button press. |
+| **hwdb** | udev's mouse database, which ships a factory DPI for a few hundred known models. Free and automatic. |
+| **assumed** | Nothing knows, so 1000 is used and the CLI says so. |
+
+`omarchy-mouse-odometer devices` names the source it is using, and `status`
+marks the distances as estimated whenever it is falling back to the assumption.
+For a gaming mouse, installing `libratbag` is the best of both worlds: no
+calibration, and it tracks hardware DPI changes.
+
 ## Calibrate
 
-Distances are only as good as the DPI they are divided by, and the default
-guess is 1000. Measuring yours takes a ruler and a minute:
+If nothing knows your mouse, measuring takes a ruler and a minute:
 
 ```bash
 omarchy-mouse-odometer calibrate
@@ -121,9 +147,25 @@ omarchy-mouse-odometer set-dpi 900 --axis y               # one axis
 omarchy-mouse-odometer restart
 ```
 
+Passes that could not physically have happened are rejected rather than
+averaged in: a reading below 200 or above 30000 DPI means the drag did not
+cover the distance you said, most often because the second Enter arrived
+before the hand moved. It tells you what it saw and retries.
+
 Config lives in `~/.config/omarchy-mouse-odometer/config.json`, as either a
-number or `{"x": 1600, "y": 900}`. Changing the DPI only affects distance
-recorded from then on.
+number or `{"x": 1600, "y": 900}`.
+
+Changing the DPI only affects distance recorded from then on — but the history
+can be brought onto the new scale, since raw counts are stored alongside
+metres and distance is linear in DPI:
+
+```bash
+omarchy-mouse-odometer rescale --from 1000     # to your newly calibrated value
+omarchy-mouse-odometer rescale --from 97 --to 1600
+```
+
+It stops the tracker while it rewrites, because the daemon holds the tally in
+memory and would otherwise flush the old numbers back over the correction.
 
 ## Commands
 

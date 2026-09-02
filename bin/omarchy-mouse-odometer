@@ -41,7 +41,18 @@ DEFAULT_DPI = 1000
 RESCAN_SECONDS = 5.0     # catch a mouse being plugged in or waking up
 FLUSH_SECONDS = 15.0     # how often a dirty state file is written
 KEEP_DAYS = 400
-AXIS_TOLERANCE = 0.03    # below this, X and Y are one sensor and one number
+DPI_SOURCE_LABEL = {
+    "calibrated": "measured here",
+    "hardware": "read from the mouse",
+    "hwdb": "from udev's mouse database",
+    "default": "assumed \u2014 not calibrated",
+}
+AXIS_TOLERANCE = 0.03
+# No mouse made runs below this or above this. A reading outside the range is
+# not a slow sensor, it is a drag that never happened at the stated distance —
+# most often the second Enter arriving before the hand moved.
+MIN_PLAUSIBLE_DPI = 200
+MAX_PLAUSIBLE_DPI = 30000    # below this, X and Y are one sensor and one number
 UNIT_NAME = "omarchy-mouse-odometer.service"
 HOURLY_KEEP_DAYS = 7     # hour-by-hour detail is a recent-history luxury
 SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
@@ -95,10 +106,11 @@ def pointer_devices():
 class Device:
     """One open evdev node, with the deltas of the report being assembled."""
 
-    def __init__(self, name, path, fd, dpi):
+    def __init__(self, name, path, fd, dpi, source="default"):
         self.name = name
         self.path = path
         self.fd = fd
+        self.source = source
         self.dpi_x, self.dpi_y = dpi if isinstance(dpi, tuple) else (dpi, dpi)
         self.dx = 0
         self.dy = 0
@@ -122,7 +134,8 @@ def load_json(path, fallback):
 
 def load_config():
     config = load_json(CONFIG_PATH, {})
-    config.setdefault("dpi", DEFAULT_DPI)
+    # No `dpi` default on purpose: absence means "work it out yourself", which
+    # is what lets a fresh install detect rather than assume.
     config.setdefault("devices", {})
     config.setdefault("units", "metric")
     return config
@@ -152,19 +165,91 @@ def as_axes(value, fallback):
         return (fallback, fallback)
 
 
-def dpi_for(config, name):
-    """A per-device DPI wins over the global one; mice differ wildly."""
-    try:
-        default = max(1.0, float(config.get("dpi", DEFAULT_DPI)))
-    except (TypeError, ValueError):
-        default = float(DEFAULT_DPI)
-    if isinstance(config.get("dpi"), dict):
-        default = as_axes(config.get("dpi"), float(DEFAULT_DPI))[0]
+def parse_hwdb_dpi(blob):
+    """Pull MOUSE_DPI out of udev properties.
 
+    udev's hwdb ships a factory DPI for a few hundred known mice. The value is
+    either a single `1000@125` or a list with the active one starred:
+    `400@125 *1000@125 3200@125`.
+    """
+    for line in (blob or "").splitlines():
+        if not line.startswith("MOUSE_DPI="):
+            continue
+        entries = line.split("=", 1)[1].split()
+        if not entries:
+            return None
+        chosen = next((e for e in entries if e.startswith("*")), entries[0])
+        try:
+            return max(1.0, float(chosen.lstrip("*").split("@")[0]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def parse_ratbag_dpi(blob):
+    """Pull the resolution out of `ratbagctl <device> dpi get` output.
+
+    Wording has moved around between libratbag releases, so this only insists
+    on a number attached to "dpi" rather than on any particular sentence.
+    """
+    import re
+    matches = re.findall(r"(\d{3,5})\s*dpi", blob or "", re.IGNORECASE)
+    if not matches:
+        return None
+    return max(1.0, float(matches[0]))
+
+
+def hwdb_dpi(path):
+    return parse_hwdb_dpi(os.popen(
+        "udevadm info --query=property --name=%s 2>/dev/null" % shell_quote(path)).read())
+
+
+def ratbag_dpi(name):
+    """libratbag knows the *live* setting, so it survives a DPI button press."""
+    if os.system("command -v ratbagctl >/dev/null 2>&1") != 0:
+        return None
+    try:
+        for line in os.popen("ratbagctl list 2>/dev/null").read().splitlines():
+            handle, _, label = line.partition(":")
+            if not handle.strip() or label.strip().lower() not in name.lower():
+                continue
+            return parse_ratbag_dpi(os.popen(
+                "ratbagctl %s dpi get 2>/dev/null" % shell_quote(handle.strip())).read())
+    except OSError:
+        return None
+    return None
+
+
+def configured_dpi(config, name):
+    """Whatever the user pinned, by device first and then globally."""
     for pattern, value in (config.get("devices") or {}).items():
         if pattern.strip().lower() in name.lower():
-            return as_axes(value, default)
-    return as_axes(config.get("dpi", DEFAULT_DPI), float(DEFAULT_DPI))
+            return as_axes(value, float(DEFAULT_DPI))
+    if config.get("dpi") is not None:
+        return as_axes(config["dpi"], float(DEFAULT_DPI))
+    return None
+
+
+def dpi_for(config, name, path=None):
+    """Resolve a device's DPI and say where the number came from.
+
+    Order matters: a calibration the user measured beats the hardware's own
+    claim, which beats a factory figure from udev, which beats a guess.
+    """
+    pinned = configured_dpi(config, name)
+    if pinned:
+        return pinned, "calibrated"
+
+    live = ratbag_dpi(name)
+    if live:
+        return (live, live), "hardware"
+
+    if path:
+        factory = hwdb_dpi(path)
+        if factory:
+            return (factory, factory), "hwdb"
+
+    return (float(DEFAULT_DPI), float(DEFAULT_DPI)), "default"
 
 
 def blank_bucket():
@@ -301,6 +386,7 @@ class Tracker:
     def device_bucket(self, device):
         bucket = self.state["devices"].setdefault(device.name, blank_bucket())
         bucket["dpi"] = device.dpi
+        bucket["dpiSource"] = device.source
         if device.dpi_x != device.dpi_y:
             bucket["dpiX"], bucket["dpiY"] = device.dpi_x, device.dpi_y
         else:
@@ -329,12 +415,13 @@ class Tracker:
                 if error.errno not in (errno.EACCES, errno.ENOENT):
                     print("mouse-odometer: %s: %s" % (path, error), file=sys.stderr)
                 continue
-            self.devices[path] = Device(name, path, fd, dpi_for(self.config, name))
+            dpi, source = dpi_for(self.config, name, path)
+            self.devices[path] = Device(name, path, fd, dpi, source)
             device = self.devices[path]
             resolution = ("%g dpi" % device.dpi_x if device.dpi_x == device.dpi_y
                           else "%g x %g dpi" % (device.dpi_x, device.dpi_y))
-            print("mouse-odometer: tracking %s (%s, %s)"
-                  % (name, path, resolution), file=sys.stderr)
+            print("mouse-odometer: tracking %s (%s, %s, %s)"
+                  % (name, path, resolution, DPI_SOURCE_LABEL.get(source, source)), file=sys.stderr)
 
         for path in [p for p in self.devices if p not in live]:
             self.drop(path)
@@ -522,6 +609,11 @@ def cmd_status(args):
           % (format_distance(summed(week, "meters"), units), format_distance(average, units)))
     print("Last 30 days%10s   (%s/day)"
           % (format_distance(summed(month, "meters"), units), format_distance(summed(month, "meters") / 30.0, units)))
+    guessed = [name for name, bucket in (state.get("devices") or {}).items()
+               if bucket.get("dpiSource") == "default"]
+    if guessed:
+        print("            %10s   distances assume %d dpi; trends are unaffected"
+              % ("(estimated)", DEFAULT_DPI))
     print("Per desk hour%9s   the number worth shrinking"
           % format_distance(per_desk_hour(today), units))
     print("All time    %10s   since %s, %s clicks"
@@ -552,9 +644,37 @@ def cmd_devices(_args):
     if not devices:
         print("No pointer devices found.")
         return 1
+    uncalibrated = False
     for name, path in devices:
+        (dpi_x, dpi_y), source = dpi_for(config, name, path)
+        resolution = "%g dpi" % dpi_x if dpi_x == dpi_y else "%g x %g dpi" % (dpi_x, dpi_y)
         readable = "" if os.access(path, os.R_OK) else "  [NOT READABLE — add yourself to the `input` group]"
-        print("%-34s %-20s %g dpi%s" % (name, path, dpi_for(config, name), readable))
+        print("%-30s %-18s %-14s %s%s"
+              % (name, path, resolution, DPI_SOURCE_LABEL.get(source, source), readable))
+        uncalibrated = uncalibrated or source == "default"
+
+    if uncalibrated:
+        print()
+        print("Nothing on this system knows that mouse's resolution, so distances")
+        print("assume %d dpi. Trends and the progress score are unaffected — DPI is a" % DEFAULT_DPI)
+        print("constant scale factor — but run `omarchy-mouse-odometer calibrate` if you")
+        print("want the metres to be real.")
+    return 0
+
+
+def cmd_detect(_args):
+    """Show what each source knows, so a wrong number can be traced."""
+    config = load_config()
+    for name, path in pointer_devices():
+        print(name)
+        print("  udev hwdb   %s" % (("%g dpi" % hwdb_dpi(path)) if hwdb_dpi(path) else "nothing recorded"))
+        live = ratbag_dpi(name)
+        print("  hardware    %s" % (("%g dpi" % live) if live
+                                    else "no libratbag support (install libratbag for gaming mice)"))
+        pinned = configured_dpi(config, name)
+        print("  calibrated  %s" % (("%g x %g dpi" % pinned) if pinned else "not measured yet"))
+        (dpi_x, dpi_y), source = dpi_for(config, name, path)
+        print("  -> using    %g dpi (%s)" % (dpi_x, DPI_SOURCE_LABEL.get(source, source)))
     return 0
 
 
@@ -600,21 +720,37 @@ def calibrate_axis(fd, axis, distance_cm, passes):
 
     print("\n%s axis — %d passes of %.1f cm, dragging %s."
           % (name.capitalize(), passes, distance_cm, direction))
-    for attempt in range(1, passes + 1):
-        input("  pass %d/%d — Enter, drag, Enter again > " % (attempt, passes))
+    attempt = 0
+    while len(readings) < passes and attempt < passes * 3:
+        attempt += 1
+        input("  pass %d/%d — put the mouse on the start mark, then press Enter > "
+              % (len(readings) + 1, passes))
+        print("    measuring — drag %.1f cm %s now, then press Enter again."
+              % (distance_cm, direction))
         dx, dy = measure_drag(fd)
         along, across = (dx, dy) if axis == "x" else (dy, dx)
         counts = abs(along)
-        if counts < 10:
-            print("    barely moved (%d counts) — repeating this pass." % counts)
+        dpi = counts / inches if inches > 0 else 0
+
+        # A pass is rejected on physics, not on taste: these bounds sit well
+        # outside anything a real sensor reports, so only a mis-run trips them.
+        if dpi < MIN_PLAUSIBLE_DPI:
+            print("    only %d counts — that is about %.1f cm of travel, not %.1f."
+                  % (counts, counts / 400.0 * 2.54, distance_cm))
+            print("    Press Enter, then drag, then press Enter again. Retrying.")
             continue
-        dpi = counts / inches
+        if dpi > MAX_PLAUSIBLE_DPI:
+            print("    %d counts is more travel than %.1f cm can hold — did the drag "
+                  "go further than the mark? Retrying." % (counts, distance_cm))
+            continue
+
         drift = abs(across) / counts
         readings.append(dpi)
         print("    %d counts -> %.0f dpi%s"
               % (counts, dpi, "   (%.0f%% off-axis drift)" % (drift * 100) if drift > 0.15 else ""))
 
     if not readings:
+        print("  No usable pass. Nothing was saved.")
         return None
     mean = statistics.mean(readings)
     spread = (max(readings) - min(readings)) / mean if len(readings) > 1 else 0
@@ -788,22 +924,90 @@ def in_input_group():
         return True
 
 
+def tracker_active():
+    return os.popen("systemctl --user is-active %s 2>/dev/null" % UNIT_NAME).read().strip() == "active"
+
+
+def rewriting_state(rewrite):
+    """Rewrite the state file with the daemon stopped.
+
+    The daemon holds the whole tally in memory and flushes every 15 seconds,
+    so editing the file underneath it means the next flush silently reinstates
+    the numbers you just corrected.
+    """
+    running = tracker_active()
+    if running:
+        os.system("systemctl --user stop " + UNIT_NAME)
+    try:
+        return rewrite()
+    finally:
+        if running:
+            os.system("systemctl --user start " + UNIT_NAME)
+
+
 def cmd_restart(_args):
     return os.system("systemctl --user restart omarchy-mouse-odometer.service") >> 8
 
 
 def cmd_reset(args):
-    state = load_state()
-    if args.all:
-        if not args.yes and input("Erase ALL mouse history? [y/N] ").strip().lower() != "y":
+    if args.all and not args.yes:
+        if input("Erase ALL mouse history? [y/N] ").strip().lower() != "y":
             return 1
-        state = {"version": STATE_VERSION, "since": dt.date.today().isoformat(),
-                 "total": blank_bucket(), "days": {}, "devices": {}}
-    else:
-        state["days"].pop(dt.date.today().isoformat(), None)
-    save_state(state)
-    print("Reset. The tracker rewrites its own copy within %ds." % FLUSH_SECONDS)
-    print("For a clean slate, restart it too: omarchy-mouse-odometer restart")
+
+    def rewrite():
+        if args.all:
+            fresh = {"version": STATE_VERSION, "since": dt.date.today().isoformat(),
+                     "total": blank_bucket(), "days": {}, "devices": {}}
+        else:
+            fresh = load_state()
+            fresh["days"].pop(dt.date.today().isoformat(), None)
+        save_state(fresh)
+
+    rewriting_state(rewrite)
+    print("Reset, and the tracker restarted on the cleared history.")
+    return 0
+
+
+def cmd_rescale(args):
+    """Re-scale recorded distance after a DPI correction.
+
+    Distance is linear in DPI, so a wrong figure is a constant factor and the
+    history can be repaired exactly rather than discarded.
+    """
+    state = load_state()
+    config = load_config()
+
+    target = args.to
+    if target is None:
+        pinned = configured_dpi(config, args.device or "")
+        if not pinned:
+            print("No calibrated DPI to scale to. Pass --to, or calibrate first.", file=sys.stderr)
+            return 1
+        target = pinned[0]
+
+    factor = float(args.frm) / float(target)
+    print("Recorded at %g dpi, correcting to %g dpi: every distance x %.4f"
+          % (args.frm, target, factor))
+    if not args.yes and input("Rewrite the stored history? [y/N] ").strip().lower() != "y":
+        return 1
+
+    def scale(bucket):
+        bucket["meters"] = float(bucket.get("meters", 0) or 0) * factor
+        if "hours" in bucket:
+            bucket["hours"] = {hour: value * factor for hour, value in bucket["hours"].items()}
+
+    def rewrite():
+        fresh = load_state()
+        scale(fresh["total"])
+        for bucket in fresh.get("days", {}).values():
+            scale(bucket)
+        for bucket in fresh.get("devices", {}).values():
+            scale(bucket)
+        save_state(fresh)
+        return 0
+
+    rewriting_state(rewrite)
+    print("Rewritten, and the tracker restarted on the corrected history.")
     return 0
 
 
@@ -825,6 +1029,7 @@ def main(argv):
     status.set_defaults(func=cmd_status)
 
     subs.add_parser("devices", help="list pointer devices being watched").set_defaults(func=cmd_devices)
+    subs.add_parser("detect", help="show where each mouse's DPI figure comes from").set_defaults(func=cmd_detect)
 
     calibrate = subs.add_parser("calibrate", help="measure the real DPI of a mouse")
     calibrate.add_argument("--cm", type=float, default=20.0, help="distance you will drag (default 20)")
@@ -846,6 +1051,14 @@ def main(argv):
     bootstrap.add_argument("--force", action="store_true", help="re-link even when already running")
     bootstrap.add_argument("--quiet", action="store_true", help="skip the desktop notification")
     bootstrap.set_defaults(func=cmd_bootstrap)
+
+    rescale = subs.add_parser("rescale", help="fix recorded distance after a DPI correction")
+    rescale.add_argument("--from", dest="frm", type=float, required=True,
+                         help="the DPI the history was recorded at")
+    rescale.add_argument("--to", type=float, help="the correct DPI (default: your calibrated value)")
+    rescale.add_argument("--device", help="device name substring for the calibrated lookup")
+    rescale.add_argument("--yes", "-y", action="store_true")
+    rescale.set_defaults(func=cmd_rescale)
 
     subs.add_parser("restart", help="restart the tracker service").set_defaults(func=cmd_restart)
 

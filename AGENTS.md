@@ -39,6 +39,14 @@
 - Settings live in the widget's `shell.json` layout entry, written through
   `persist()` so a click survives a restart. Nothing else may write there.
 
+- **Never rewrite the state file while the daemon runs.** It holds the whole
+  tally in memory and flushes every 15s, so an edit underneath it is silently
+  reinstated. `rewriting_state()` stops and restarts around the write; use it.
+- **DPI only scales absolute distance.** Every comparison in the UI is
+  scale-invariant, so a wrong DPI is never a reason to block or discard data —
+  and `rescale` can move a history onto a corrected figure exactly, because
+  raw counts are kept next to metres.
+
 ## Testing
 
 There is no uinput access under a normal user, so the daemon's event path is
