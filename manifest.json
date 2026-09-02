@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "odin.mouse-odometer",
+  "name": "Mouse Odometer",
+  "version": "1.1.0",
+  "author": "odin",
+  "license": "MIT",
+  "description": "A live graph of how far your mouse has actually travelled — today, this week, all time.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Mouse Odometer",
+    "description": "Sparkline and distance for the mouse movement your hand actually made, measured from raw evdev counts",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "units": "metric",
+      "show": "today",
+      "graph": "hours",
+      "graphPoints": 16,
+      "graphBarWidth": 2,
+      "showDelta": true,
+      "showNumber": true,
+      "goalMeters": 0
+    },
+    "schema": [
+      {
+        "key": "units",
+        "type": "string",
+        "label": "Units",
+        "description": "metric (m/km) or imperial (ft/mi)",
+        "defaultValue": "metric"
+      },
+      {
+        "key": "show",
+        "type": "string",
+        "label": "Number shown",
+        "description": "today, week or total",
+        "defaultValue": "today"
+      },
+      {
+        "key": "graph",
+        "type": "string",
+        "label": "Graph",
+        "description": "hours (the last hours), days (the last days) or off",
+        "defaultValue": "hours"
+      },
+      {
+        "key": "graphPoints",
+        "type": "integer",
+        "label": "Graph columns",
+        "description": "How many hours or days the sparkline covers",
+        "min": 4,
+        "max": 48,
+        "step": 1,
+        "defaultValue": 16
+      },
+      {
+        "key": "graphBarWidth",
+        "type": "integer",
+        "label": "Column width (px)",
+        "min": 1,
+        "max": 6,
+        "step": 1,
+        "defaultValue": 2
+      },
+      {
+        "key": "showDelta",
+        "type": "boolean",
+        "label": "Show trend arrow",
+        "description": "Today against the last seven days, as ↓12% / ↑8%",
+        "defaultValue": true
+      },
+      {
+        "key": "showNumber",
+        "type": "boolean",
+        "label": "Show the number",
+        "description": "Turn off for a graph-only widget",
+        "defaultValue": true
+      },
+      {
+        "key": "goalMeters",
+        "type": "integer",
+        "label": "Daily goal (metres)",
+        "description": "The widget turns urgent past this. 0 turns the goal off.",
+        "min": 0,
+        "max": 100000,
+        "step": 50,
+        "defaultValue": 0
+      }
+    ]
+  }
+}

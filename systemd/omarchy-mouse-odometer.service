@@ -1,0 +1,18 @@
+[Unit]
+Description=Omarchy mouse odometer — measures how far the mouse actually travels
+Documentation=file:%h/.config/omarchy/plugins/odin.mouse-odometer/README.md
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/odin.mouse-odometer/bin/omarchy-mouse-odometer run
+# Reading evdev needs no privilege beyond the `input` group, so drop the rest.
+NoNewPrivileges=yes
+StateDirectory=omarchy-mouse-odometer
+Restart=always
+RestartSec=5
+# Never let odometry compete with anything the user is actually doing.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

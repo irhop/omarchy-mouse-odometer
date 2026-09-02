@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""omarchy-mouse-odometer — how far your mouse actually travels.
+
+Reads relative motion straight off the kernel's evdev devices, which is the
+raw stream *before* libinput's pointer acceleration. That means the distance
+here is desk centimetres your hand really moved, not screen pixels the cursor
+jumped: 400 counts at 1000 DPI is 1 cm of desk, whatever the cursor did.
+
+Membership in the `input` group is enough to read the devices; no root.
+
+  omarchy-mouse-odometer run          # the tracker (systemd --user runs this)
+  omarchy-mouse-odometer status       # today / week / all-time summary
+  omarchy-mouse-odometer devices      # which pointers are being watched
+  omarchy-mouse-odometer calibrate    # measure your mouse's real DPI
+  omarchy-mouse-odometer set-dpi 1600 # record it
+  omarchy-mouse-odometer reset --today
+"""
+
+import argparse
+import datetime as dt
+import errno
+import json
+import math
+import os
+import select
+import signal
+import struct
+import sys
+import time
+
+# struct input_event { struct timeval time; __u16 type, code; __s32 value; }
+EVENT = struct.Struct("llHHi")
+EV_KEY, EV_REL = 0x01, 0x02
+EV_SYN, SYN_REPORT = 0x00, 0x00
+REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
+BTN_FIRST, BTN_LAST = 0x110, 0x117  # BTN_LEFT .. BTN_TASK
+
+INCH_M = 0.0254
+DEFAULT_DPI = 1000
+RESCAN_SECONDS = 5.0     # catch a mouse being plugged in or waking up
+FLUSH_SECONDS = 15.0     # how often a dirty state file is written
+KEEP_DAYS = 400
+UNIT_NAME = "omarchy-mouse-odometer.service"
+HOURLY_KEEP_DAYS = 7     # hour-by-hour detail is a recent-history luxury
+SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+STATE_VERSION = 1
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("OMARCHY_MOUSE_ODOMETER_STATE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"),
+    "omarchy-mouse-odometer")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+    "omarchy-mouse-odometer", "config.json")
+
+
+# ---------------------------------------------------------------- discovery
+
+def pointer_devices():
+    """Every device reporting relative X *and* Y — a mouse, trackball or trackpoint.
+
+    Keyboards with a scroll wheel report REL too, so both axes are required.
+    """
+    found = []
+    try:
+        with open("/proc/bus/input/devices") as handle:
+            blob = handle.read()
+    except OSError:
+        return found
+
+    for block in blob.split("\n\n"):
+        name, handlers, rel = "", [], 0
+        for line in block.splitlines():
+            if line.startswith("N: Name="):
+                name = line.split("=", 1)[1].strip().strip('"').strip()
+            elif line.startswith("H: Handlers="):
+                handlers = line.split("=", 1)[1].split()
+            elif line.startswith("B: REL="):
+                # Multi-word masks print most-significant first, so bits 0-63
+                # (REL_X, REL_Y) always live in the last word.
+                words = line.split("=", 1)[1].split()
+                rel = int(words[-1], 16) if words else 0
+        if rel & 0b11 != 0b11:
+            continue
+        for handler in handlers:
+            if handler.startswith("event"):
+                found.append((name or handler, "/dev/input/" + handler))
+                break
+    return found
+
+
+class Device:
+    """One open evdev node, with the deltas of the report being assembled."""
+
+    def __init__(self, name, path, fd, dpi):
+        self.name = name
+        self.path = path
+        self.fd = fd
+        self.dpi = dpi
+        self.dx = 0
+        self.dy = 0
+
+
+# ------------------------------------------------------------ config/state
+
+def load_json(path, fallback):
+    try:
+        with open(path) as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else dict(fallback)
+    except (OSError, ValueError):
+        return dict(fallback)
+
+
+def load_config():
+    config = load_json(CONFIG_PATH, {})
+    config.setdefault("dpi", DEFAULT_DPI)
+    config.setdefault("devices", {})
+    config.setdefault("units", "metric")
+    return config
+
+
+def save_config(config):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    write_atomic(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
+
+
+def dpi_for(config, name):
+    """A per-device DPI wins over the global one; mice differ wildly."""
+    for pattern, value in (config.get("devices") or {}).items():
+        if pattern.strip().lower() in name.lower():
+            try:
+                return max(1.0, float(value))
+            except (TypeError, ValueError):
+                pass
+    try:
+        return max(1.0, float(config.get("dpi", DEFAULT_DPI)))
+    except (TypeError, ValueError):
+        return float(DEFAULT_DPI)
+
+
+def blank_bucket():
+    return {"meters": 0.0, "counts": 0.0, "clicks": 0, "scrolls": 0, "active_seconds": 0}
+
+
+def load_state():
+    state = load_json(STATE_PATH, {})
+    state.setdefault("version", STATE_VERSION)
+    state.setdefault("since", dt.date.today().isoformat())
+    state.setdefault("total", blank_bucket())
+    state.setdefault("days", {})
+    state.setdefault("devices", {})
+    for key in blank_bucket():
+        state["total"].setdefault(key, 0)
+    return state
+
+
+def write_atomic(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def save_state(state):
+    state["updated"] = dt.datetime.now().replace(microsecond=0).isoformat()
+
+    days = state.get("days") or {}
+    if len(days) > KEEP_DAYS:
+        for stale in sorted(days)[:-KEEP_DAYS]:
+            days.pop(stale, None)
+
+    def rounded(bucket):
+        out = dict(bucket)
+        out["meters"] = round(float(out.get("meters", 0.0)), 3)
+        out["counts"] = round(float(out.get("counts", 0.0)), 1)
+        if "hours" in out:
+            out["hours"] = {hour: round(float(value), 3) for hour, value in out["hours"].items()}
+        return out
+
+    recent = set(sorted(days)[-HOURLY_KEEP_DAYS:])
+    for day, bucket in days.items():
+        if day not in recent:
+            bucket.pop("hours", None)
+
+    payload = dict(state)
+    payload["total"] = rounded(state["total"])
+    payload["days"] = {day: rounded(bucket) for day, bucket in sorted(days.items())}
+    payload["devices"] = {name: rounded(bucket) for name, bucket in (state.get("devices") or {}).items()}
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_atomic(STATE_PATH, json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+# ------------------------------------------------------------------ format
+
+def format_metric(meters):
+    if meters >= 1000:
+        return "%.2f km" % (meters / 1000.0)
+    if meters >= 1:
+        return "%.0f m" % meters
+    return "%.0f cm" % (meters * 100)
+
+
+def format_imperial(meters):
+    feet = meters / 0.3048
+    if feet >= 5280:
+        return "%.2f mi" % (feet / 5280.0)
+    if feet >= 1:
+        return "%.0f ft" % feet
+    return "%.0f in" % (meters / INCH_M)
+
+
+def format_distance(meters, units):
+    return format_imperial(meters) if units == "imperial" else format_metric(meters)
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return "%dh %02dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
+# ------------------------------------------------------------------ daemon
+
+def next_midnight(timestamp):
+    tomorrow = dt.date.fromtimestamp(timestamp) + dt.timedelta(days=1)
+    return time.mktime((tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, 0, 0, -1))
+
+
+class Tracker:
+    def __init__(self, config, state):
+        self.config = config
+        self.state = state
+        self.devices = {}
+        self.dirty = False
+        self.last_active_second = 0
+        now = time.time()
+        self.day = dt.date.fromtimestamp(now).isoformat()
+        self.day_ends = next_midnight(now)
+        self.hour = ""
+        self.hour_starts = 0.0
+        self.hour_ends = 0.0
+
+    # -- buckets
+
+    def bucket(self, timestamp):
+        if timestamp >= self.day_ends:
+            self.day = dt.date.fromtimestamp(timestamp).isoformat()
+            self.day_ends = next_midnight(timestamp)
+            self.flush()
+        return self.state["days"].setdefault(self.day, blank_bucket())
+
+    def hours(self, day, timestamp):
+        """The hour slot for this event, kept sparse — only hours you moved in.
+
+        Derived from the local minute and second rather than a modulo of the
+        epoch, so the half-hour timezones land on their real hour boundaries.
+        """
+        if not (self.hour_starts <= timestamp < self.hour_ends):
+            local = time.localtime(timestamp)
+            self.hour = str(local.tm_hour)
+            self.hour_starts = timestamp - (local.tm_min * 60 + local.tm_sec)
+            self.hour_ends = self.hour_starts + 3600
+        return day.setdefault("hours", {})
+
+    def device_bucket(self, device):
+        bucket = self.state["devices"].setdefault(device.name, blank_bucket())
+        bucket["dpi"] = device.dpi
+        return bucket
+
+    def tally(self, seconds, device, field, amount):
+        """Every count lands in all three ledgers: the day, all time, the device."""
+        self.bucket(seconds)[field] += amount
+        self.state["total"][field] += amount
+        self.device_bucket(device)[field] += amount
+        self.dirty = True
+
+    # -- devices
+
+    def rescan(self):
+        live = {}
+        for name, path in pointer_devices():
+            live[path] = name
+            if path in self.devices:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.ENOENT):
+                    print("mouse-odometer: %s: %s" % (path, error), file=sys.stderr)
+                continue
+            self.devices[path] = Device(name, path, fd, dpi_for(self.config, name))
+            print("mouse-odometer: tracking %s (%s, %g dpi)"
+                  % (name, path, self.devices[path].dpi), file=sys.stderr)
+
+        for path in [p for p in self.devices if p not in live]:
+            self.drop(path)
+
+    def drop(self, path):
+        device = self.devices.pop(path, None)
+        if not device:
+            return
+        try:
+            os.close(device.fd)
+        except OSError:
+            pass
+        print("mouse-odometer: dropped %s" % device.name, file=sys.stderr)
+
+    # -- events
+
+    def read(self, device):
+        try:
+            data = os.read(device.fd, EVENT.size * 256)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:
+            return False
+
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            seconds, _usec, kind, code, value = EVENT.unpack_from(data, offset)
+            if kind == EV_REL:
+                if code == REL_X:
+                    device.dx += value
+                elif code == REL_Y:
+                    device.dy += value
+                elif code in (REL_WHEEL, REL_HWHEEL):
+                    # Only the coarse wheel axes; the HI_RES twins would
+                    # double-count the same physical detent.
+                    self.tally(seconds, device, "scrolls", abs(value))
+            elif kind == EV_KEY and BTN_FIRST <= code <= BTN_LAST and value == 1:
+                self.tally(seconds, device, "clicks", 1)
+            elif kind == EV_SYN and code == SYN_REPORT:
+                self.commit(device, seconds)
+        return True
+
+    def commit(self, device, seconds):
+        """One SYN_REPORT of motion: add its straight-line hop to the path."""
+        if not device.dx and not device.dy:
+            return
+        counts = math.hypot(device.dx, device.dy)
+        device.dx = device.dy = 0
+        meters = counts / device.dpi * INCH_M
+
+        day = self.bucket(seconds)
+        for bucket in (day, self.state["total"], self.device_bucket(device)):
+            bucket["counts"] += counts
+            bucket["meters"] += meters
+
+        hours = self.hours(day, seconds)
+        hours[self.hour] = hours.get(self.hour, 0.0) + meters
+
+        # "Active" time is wall-clock seconds in which the mouse moved at all,
+        # which is what makes metres-per-hour mean anything.
+        if seconds != self.last_active_second:
+            self.last_active_second = seconds
+            day["active_seconds"] += 1
+            self.state["total"]["active_seconds"] += 1
+
+        self.dirty = True
+
+    # -- loop
+
+    def flush(self):
+        if not self.dirty:
+            return
+        save_state(self.state)
+        self.dirty = False
+
+    def run(self):
+        stopping = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: stopping.append(True))
+
+        self.rescan()
+        save_state(self.state)
+        next_scan = time.monotonic() + RESCAN_SECONDS
+        next_flush = time.monotonic() + FLUSH_SECONDS
+
+        while not stopping:
+            fds = [device.fd for device in self.devices.values()]
+            try:
+                ready, _, _ = select.select(fds, [], [], 1.0)
+            except InterruptedError:
+                continue
+            except OSError:
+                ready = []
+
+            for fd in ready:
+                device = next((d for d in self.devices.values() if d.fd == fd), None)
+                if device and not self.read(device):
+                    self.drop(device.path)
+
+            now = time.monotonic()
+            if now >= next_scan:
+                self.rescan()
+                next_scan = now + RESCAN_SECONDS
+            if now >= next_flush:
+                self.flush()
+                next_flush = now + FLUSH_SECONDS
+
+        self.flush()
+        save_state(self.state)
+        return 0
+
+
+# ------------------------------------------------------------------- report
+
+def day_range(state, days, start=0):
+    today = dt.date.today()
+    return [state.get("days", {}).get((today - dt.timedelta(days=offset)).isoformat(), blank_bucket())
+            for offset in range(start, start + days)]
+
+
+def sparkline(values):
+    peak = max(values) if values else 0
+    if peak <= 0:
+        return SPARK_BLOCKS[0] * len(values)
+    steps = len(SPARK_BLOCKS) - 1
+    return "".join(SPARK_BLOCKS[int(round(value / peak * steps))] for value in values)
+
+
+def hourly_series(state, day_key, hours=24):
+    """Today's metres, hour by hour, as a plain list of 24 numbers."""
+    bucket = state.get("days", {}).get(day_key, {})
+    stored = bucket.get("hours", {}) or {}
+    return [float(stored.get(str(hour), 0) or 0) for hour in range(hours)]
+
+
+def summed(buckets, key):
+    return sum(float(bucket.get(key, 0) or 0) for bucket in buckets)
+
+
+def cmd_status(args):
+    config = load_config()
+    units = "imperial" if args.imperial else ("metric" if args.metric else config.get("units", "metric"))
+    state = load_state()
+
+    if args.json:
+        print(json.dumps(state, indent=2))
+        return 0
+
+    if not os.path.exists(STATE_PATH):
+        print("No data yet. Start the tracker with:\n"
+              "  systemctl --user enable --now omarchy-mouse-odometer.service")
+        return 1
+
+    today = state.get("days", {}).get(dt.date.today().isoformat(), blank_bucket())
+    week = day_range(state, 7)
+    month = day_range(state, 30)
+    total = state.get("total", blank_bucket())
+    # Yesterday back a week: a baseline today can be judged against.
+    average = summed(day_range(state, 7, 1), "meters") / 7.0
+    delta = ((float(today.get("meters", 0)) / average - 1) * 100) if average > 0 else 0.0
+
+    print("Today       %10s   %s%.0f%% vs the previous 7 days"
+          % (format_distance(today.get("meters", 0), units), "+" if delta >= 0 else "", delta))
+    print("            %10s clicks, %s scroll ticks, %s of active mousing"
+          % ("{:,}".format(int(today.get("clicks", 0))),
+             "{:,}".format(int(today.get("scrolls", 0))),
+             format_duration(today.get("active_seconds", 0))))
+    print("Last 7 days %10s   (%s/day)"
+          % (format_distance(summed(week, "meters"), units), format_distance(average, units)))
+    print("Last 30 days%10s   (%s/day)"
+          % (format_distance(summed(month, "meters"), units), format_distance(summed(month, "meters") / 30.0, units)))
+    print("All time    %10s   since %s, %s clicks"
+          % (format_distance(total.get("meters", 0), units), state.get("since", "?"),
+             "{:,}".format(int(total.get("clicks", 0)))))
+
+    print()
+    print("14 days     %s  (now %s)"
+          % (sparkline([float(bucket.get("meters", 0) or 0) for bucket in reversed(day_range(state, 14))]),
+             format_distance(today.get("meters", 0), units)))
+    print("Today       %s  hour by hour, 00-23"
+          % sparkline(hourly_series(state, dt.date.today().isoformat())))
+
+    if args.verbose:
+        print()
+        for name, bucket in sorted((state.get("devices") or {}).items(),
+                                   key=lambda item: -float(item[1].get("meters", 0))):
+            print("  %-34s %10s at %g dpi"
+                  % (name, format_distance(bucket.get("meters", 0), units), bucket.get("dpi", DEFAULT_DPI)))
+    return 0
+
+
+def cmd_devices(_args):
+    config = load_config()
+    devices = pointer_devices()
+    if not devices:
+        print("No pointer devices found.")
+        return 1
+    for name, path in devices:
+        readable = "" if os.access(path, os.R_OK) else "  [NOT READABLE — add yourself to the `input` group]"
+        print("%-34s %-20s %g dpi%s" % (name, path, dpi_for(config, name), readable))
+    return 0
+
+
+def cmd_calibrate(args):
+    devices = pointer_devices()
+    if args.device:
+        devices = [d for d in devices if args.device.lower() in d[0].lower() or args.device in d[1]]
+    if not devices:
+        print("No matching pointer device.", file=sys.stderr)
+        return 1
+    name, path = devices[0]
+
+    print("Calibrating: %s" % name)
+    print("Put the mouse on a ruler or the edge of a keyboard, note where it starts.")
+    print("Press Enter, drag it exactly %.1f cm in one smooth motion, then press Enter again."
+          % args.cm)
+    input("  ready > ")
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as error:
+        print("Cannot read %s: %s" % (path, error), file=sys.stderr)
+        return 1
+
+    counts, dx, dy = 0.0, 0, 0
+    try:
+        while True:
+            ready, _, _ = select.select([fd, sys.stdin], [], [])
+            if sys.stdin in ready:
+                sys.stdin.readline()
+                break
+            try:
+                data = os.read(fd, EVENT.size * 256)
+            except BlockingIOError:
+                continue
+            for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _s, _u, kind, code, value = EVENT.unpack_from(data, offset)
+                if kind == EV_REL and code == REL_X:
+                    dx += value
+                elif kind == EV_REL and code == REL_Y:
+                    dy += value
+                elif kind == EV_SYN and code == SYN_REPORT:
+                    counts += math.hypot(dx, dy)
+                    dx = dy = 0
+    finally:
+        os.close(fd)
+
+    if counts < 10:
+        print("Barely any movement registered (%.0f counts) — try again." % counts, file=sys.stderr)
+        return 1
+
+    dpi = counts / (args.cm / 2.54)
+    print("\n%.0f counts over %.1f cm  ->  %.0f DPI" % (counts, args.cm, dpi))
+    print("(common values are 400, 800, 1000, 1200, 1600, 3200 — round to the nearest)")
+
+    if args.save or input("Save %.0f DPI for \"%s\"? [y/N] " % (dpi, name)).strip().lower() == "y":
+        config = load_config()
+        config["devices"][name] = round(dpi)
+        save_config(config)
+        print("Saved to %s. Restart the tracker: omarchy-mouse-odometer restart" % CONFIG_PATH)
+    return 0
+
+
+def cmd_set_dpi(args):
+    config = load_config()
+    if args.device:
+        config["devices"][args.device] = args.dpi
+    else:
+        config["dpi"] = args.dpi
+    save_config(config)
+    print("Wrote %s" % CONFIG_PATH)
+    print("Restart the tracker to pick it up: omarchy-mouse-odometer restart")
+    return 0
+
+
+def cmd_bootstrap(args):
+    """Install and start the user service. Idempotent, and safe to call from
+    the widget: a plugin installed with `omarchy plugin add` never gets to run
+    an install script, so the bar has to be able to set itself up."""
+    active = os.popen("systemctl --user is-active omarchy-mouse-odometer.service 2>/dev/null").read().strip()
+    if active == "active" and not args.force:
+        print("Tracker already running.")
+        return 0
+
+    plugin_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    unit_source = os.path.join(plugin_dir, "systemd", UNIT_NAME)
+    if not os.path.exists(unit_source):
+        print("Cannot find %s" % unit_source, file=sys.stderr)
+        return 1
+
+    unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                            "systemd", "user")
+    os.makedirs(unit_dir, exist_ok=True)
+    unit_link = os.path.join(unit_dir, UNIT_NAME)
+    if os.path.realpath(unit_link) != unit_source:
+        if os.path.lexists(unit_link):
+            os.unlink(unit_link)
+        os.symlink(unit_source, unit_link)
+
+    # A CLI on PATH is the difference between a tool and a background process.
+    bin_dir = os.path.join(HOME, ".local", "bin")
+    if os.path.isdir(bin_dir):
+        link = os.path.join(bin_dir, "omarchy-mouse-odometer")
+        target = os.path.realpath(__file__)
+        if os.path.realpath(link) != target:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(target, link)
+
+    if not in_input_group():
+        print("Warning: you are not in the 'input' group, so the tracker cannot read the mouse.",
+              file=sys.stderr)
+        print("  sudo usermod -aG input %s   (then log out and back in)"
+              % os.environ.get("USER", "$USER"), file=sys.stderr)
+
+    os.system("systemctl --user daemon-reload")
+    return os.system("systemctl --user enable --now " + UNIT_NAME) >> 8
+
+
+def in_input_group():
+    try:
+        import grp
+        return "input" in [grp.getgrgid(gid).gr_name for gid in os.getgroups()]
+    except Exception:
+        return True
+
+
+def cmd_restart(_args):
+    return os.system("systemctl --user restart omarchy-mouse-odometer.service") >> 8
+
+
+def cmd_reset(args):
+    state = load_state()
+    if args.all:
+        if not args.yes and input("Erase ALL mouse history? [y/N] ").strip().lower() != "y":
+            return 1
+        state = {"version": STATE_VERSION, "since": dt.date.today().isoformat(),
+                 "total": blank_bucket(), "days": {}, "devices": {}}
+    else:
+        state["days"].pop(dt.date.today().isoformat(), None)
+    save_state(state)
+    print("Reset. The tracker rewrites its own copy within %ds." % FLUSH_SECONDS)
+    print("For a clean slate, restart it too: omarchy-mouse-odometer restart")
+    return 0
+
+
+def cmd_run(_args):
+    return Tracker(load_config(), load_state()).run()
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="omarchy-mouse-odometer", description=__doc__.splitlines()[0])
+    subs = parser.add_subparsers(dest="command")
+
+    subs.add_parser("run", help="track pointer movement (the systemd service)").set_defaults(func=cmd_run)
+
+    status = subs.add_parser("status", help="today / week / all-time summary")
+    status.add_argument("--json", action="store_true", help="dump the raw state file")
+    status.add_argument("--verbose", "-v", action="store_true", help="per-device breakdown")
+    status.add_argument("--metric", action="store_true")
+    status.add_argument("--imperial", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    subs.add_parser("devices", help="list pointer devices being watched").set_defaults(func=cmd_devices)
+
+    calibrate = subs.add_parser("calibrate", help="measure the real DPI of a mouse")
+    calibrate.add_argument("--cm", type=float, default=20.0, help="distance you will drag (default 20)")
+    calibrate.add_argument("--device", help="device name substring")
+    calibrate.add_argument("--save", action="store_true", help="save without asking")
+    calibrate.set_defaults(func=cmd_calibrate)
+
+    setdpi = subs.add_parser("set-dpi", help="record a known DPI")
+    setdpi.add_argument("dpi", type=float)
+    setdpi.add_argument("--device", help="device name substring (default: all mice)")
+    setdpi.set_defaults(func=cmd_set_dpi)
+
+    bootstrap = subs.add_parser("bootstrap", help="install and start the tracker service")
+    bootstrap.add_argument("--force", action="store_true", help="re-link even when already running")
+    bootstrap.set_defaults(func=cmd_bootstrap)
+
+    subs.add_parser("restart", help="restart the tracker service").set_defaults(func=cmd_restart)
+
+    reset = subs.add_parser("reset", help="clear today's tally, or everything")
+    reset.add_argument("--all", action="store_true")
+    reset.add_argument("--today", action="store_true")
+    reset.add_argument("--yes", "-y", action="store_true")
+    reset.set_defaults(func=cmd_reset)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        args = parser.parse_args(["status"])
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

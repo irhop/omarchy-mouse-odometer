@@ -1,0 +1,42 @@
+# Working on this plugin
+
+## Shape
+
+| File | Role |
+|---|---|
+| `bin/omarchy-mouse-odometer` | Python 3 daemon + CLI. No third-party imports — keep it that way, it has to run before anything is installed. |
+| `Format.js` | Every number the user sees is derived here, so the bar and the panel can never disagree. |
+| `Sparkline.qml` | The graph, used at 12px in the bar and at 44px in the panel. |
+| `BarWidget.qml` | Bar entry point. Owns the `FileView`, the parsed state, and every setting. |
+| `Panel.qml` | The popup. Reads everything off `hostWidget`; it never parses state itself. |
+
+## Rules that matter
+
+- **The daemon is the only thing that touches `/dev/input`.** The QML side is a
+  reader of one JSON file. Keep it that way: anything else would put evdev
+  parsing inside the compositor's shell process.
+- **State is metres, not counts.** Counts are kept for the record, but DPI can
+  change, so distance is converted at write time and never recomputed.
+- **Buckets are three-way.** Day, all-time, and per-device. Route new counters
+  through `Tracker.tally()` — an earlier version incremented only the day
+  bucket and the all-time clicks silently stayed at zero.
+- **Hourly detail is sparse and pruned.** Only hours with movement are stored,
+  and only for `HOURLY_KEEP_DAYS`; otherwise the state file grows without
+  bound for data nobody reads.
+- Settings live in the widget's `shell.json` layout entry, written through
+  `persist()` so a click survives a restart. Nothing else may write there.
+
+## Testing
+
+There is no uinput access under a normal user, so the daemon's event path is
+tested by feeding packed `input_event` structs through a pipe — see the commit
+history for the harness. The struct is `struct.Struct("llHHi")`, 24 bytes on
+64-bit; verify that before blaming anything else.
+
+Check QML changes with:
+
+```bash
+omarchy plugin validate ~/.config/omarchy/plugins/odin.mouse-odometer
+omarchy-shell shell rescanPlugins
+qs -p /usr/share/omarchy/shell log | grep -i odometer
+```
