@@ -27,6 +27,15 @@
 - **Hourly detail is sparse and pruned.** Only hours with movement are stored,
   and only for `HOURLY_KEEP_DAYS`; otherwise the state file grows without
   bound for data nobody reads.
+- **The score is metres per *desk* hour, never per mousing hour.** Dividing by
+  time-the-mouse-was-moving measures sweep speed, which is near-constant per
+  person and barely responds to using the mouse less — the exact thing the
+  score exists to reward. Desk hours are hours with any movement in them,
+  counted from the sparse hourly buckets into `desk_hours` so the number
+  survives hourly pruning.
+- **Baselines are medians and days are qualified.** A day under two desk hours
+  is not scored, and one wild afternoon must not redefine normal. Days away
+  from the machine skip the streak rather than breaking it.
 - Settings live in the widget's `shell.json` layout entry, written through
   `persist()` so a click survives a restart. Nothing else may write there.
 

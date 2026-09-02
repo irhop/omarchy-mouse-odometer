@@ -168,7 +168,8 @@ def dpi_for(config, name):
 
 
 def blank_bucket():
-    return {"meters": 0.0, "counts": 0.0, "clicks": 0, "scrolls": 0, "active_seconds": 0}
+    return {"meters": 0.0, "counts": 0.0, "clicks": 0, "scrolls": 0,
+            "active_seconds": 0, "desk_hours": 0}
 
 
 def load_state():
@@ -396,6 +397,11 @@ class Tracker:
 
         hours = self.hours(day, seconds)
         hours[self.hour] = hours.get(self.hour, 0.0) + meters
+        # Hours in which the machine was used at all. It is the denominator
+        # that makes progress measurable: metres per desk hour falls when you
+        # reach for the keyboard instead, where metres per *mousing* hour just
+        # measures how fast your hand sweeps and barely moves at all.
+        day["desk_hours"] = len(hours)
 
         # "Active" time is wall-clock seconds in which the mouse moved at all,
         # which is what makes metres-per-hour mean anything.
@@ -474,6 +480,12 @@ def hourly_series(state, day_key, hours=24):
     return [float(stored.get(str(hour), 0) or 0) for hour in range(hours)]
 
 
+def per_desk_hour(bucket):
+    """Metres divided by hours in which the machine was used at all."""
+    hours = float(bucket.get("desk_hours", 0) or 0)
+    return (float(bucket.get("meters", 0) or 0) / hours) if hours > 0 else 0.0
+
+
 def summed(buckets, key):
     return sum(float(bucket.get(key, 0) or 0) for bucket in buckets)
 
@@ -510,6 +522,8 @@ def cmd_status(args):
           % (format_distance(summed(week, "meters"), units), format_distance(average, units)))
     print("Last 30 days%10s   (%s/day)"
           % (format_distance(summed(month, "meters"), units), format_distance(summed(month, "meters") / 30.0, units)))
+    print("Per desk hour%9s   the number worth shrinking"
+          % format_distance(per_desk_hour(today), units))
     print("All time    %10s   since %s, %s clicks"
           % (format_distance(total.get("meters", 0), units), state.get("since", "?"),
              "{:,}".format(int(total.get("clicks", 0)))))
@@ -745,9 +759,11 @@ def cmd_bootstrap(args):
     os.system("systemctl --user daemon-reload")
     status = os.system("systemctl --user enable --now " + UNIT_NAME) >> 8
     if status == 0 and not args.quiet:
-        notify("Mouse Odometer",
-               "Tracker service installed and started. Disable it any time with "
-               "`systemctl --user disable --now %s`." % UNIT_NAME)
+        notify("Mouse Odometer is running",
+               "Omarchy is built to be driven from the keyboard, so the point of "
+               "this is to watch the number go down. Give it a week to learn your "
+               "baseline. Distances are an estimate, not a measurement \u2014 run "
+               "`omarchy-mouse-odometer calibrate` to make them yours.")
     return status
 
 

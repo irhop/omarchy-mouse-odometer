@@ -58,6 +58,7 @@ function recentDays(state, count, reference) {
       clicks: Number(day.clicks) || 0,
       scrolls: Number(day.scrolls) || 0,
       activeSeconds: Number(day.active_seconds) || 0,
+      deskHours: Number(day.desk_hours) || 0,
       isToday: offset === 0
     })
   }
@@ -207,4 +208,83 @@ function todayHourly(state, reference) {
     })
   }
   return out
+}
+
+// --- Progress ---------------------------------------------------------------
+//
+// The score is metres per desk hour: metres divided by the hours in which the
+// machine was used at all. Dividing by *mousing* time instead would measure
+// how fast a hand sweeps — near-constant per person, and barely moved by
+// reaching for the keyboard instead, which is the whole point.
+
+// A day needs a couple of hours on it before its ratio means anything; a
+// ten-minute evening check-in would otherwise post a wild score.
+var MIN_DESK_HOURS = 2
+
+function perDeskHour(day) {
+  if (!day || !day.deskHours) return 0
+  return day.meters / day.deskHours
+}
+
+function qualifies(day) {
+  return !!day && day.deskHours >= MIN_DESK_HOURS && day.meters > 0
+}
+
+function median(values) {
+  if (!values.length) return 0
+  var sorted = values.slice().sort(function(a, b) { return a - b })
+  var middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+}
+
+// Median, not mean: one chaotic day of dragging windows around should not
+// redefine what normal looks like for the fortnight.
+function baseline(days, count) {
+  var scores = []
+  for (var i = 0; i < days.length; i++) {
+    var day = days[i]
+    if (day.isToday || !qualifies(day)) continue
+    scores.push(perDeskHour(day))
+  }
+  if (count && scores.length > count) scores = scores.slice(-count)
+  return median(scores)
+}
+
+// Consecutive days coming in under the baseline. Days you were not at the
+// machine are skipped rather than counted as failures — a holiday should not
+// cost you a streak you earned.
+function streak(days, threshold) {
+  if (!threshold || threshold <= 0) return 0
+  var run = 0
+  for (var i = days.length - 1; i >= 0; i--) {
+    var day = days[i]
+    if (!qualifies(day)) {
+      if (day.isToday) continue
+      if (day.meters === 0) continue
+      return run
+    }
+    if (perDeskHour(day) < threshold) run++
+    else return run
+  }
+  return run
+}
+
+function personalBest(days) {
+  var best = null
+  for (var i = 0; i < days.length; i++) {
+    if (!qualifies(days[i])) continue
+    var score = perDeskHour(days[i])
+    if (best === null || score < best.score) best = { score: score, day: days[i] }
+  }
+  return best
+}
+
+// This week's typical day against last week's, which is the timescale a habit
+// actually shows up on.
+function weekOverWeek(days) {
+  if (days.length < 8) return null
+  var thisWeek = baseline(days.slice(-7).concat([]), 0)
+  var lastWeek = baseline(days.slice(-14, -7), 0)
+  if (!thisWeek || !lastWeek) return null
+  return { current: thisWeek, previous: lastWeek, delta: (thisWeek / lastWeek - 1) * 100 }
 }

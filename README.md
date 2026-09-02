@@ -157,6 +157,7 @@ with `omarchy bar set`:
 | `showDelta` | `true` | The ↓12% trend arrow |
 | `showNumber` | `true` | Turn off for a graph-only widget |
 | `goalMeters` | `0` | Daily budget in metres; the widget turns urgent above it |
+| `gamify` | `false` | Baseline, streak and personal best in the panel, streak badge in the bar |
 | `autostart` | `true` | Install and start the tracker service on first load |
 | `icon` | `󰍽` | Glyph in front of the graph |
 
@@ -183,6 +184,50 @@ move into the tooltip and the panel.
 The daemon holds one file descriptor per mouse and wakes only when the mouse
 moves. Daily history is kept for 400 days; the hour-by-hour detail behind the
 graph is kept for 7 and then rolls off, so the state file stays small.
+
+## Progress tracking
+
+Off by default; turn it on from the first-run card in the panel, or with
+`omarchy bar set io.github.irhop.mouse-odometer gamify true`.
+
+The score is **metres per desk hour** — metres divided by the hours in which
+you used the machine at all. That denominator is the whole trick. Dividing by
+*mousing* time instead measures how fast your hand sweeps, which is close to a
+constant per person: reach for the keyboard instead of the mouse and you
+remove both the metres and the seconds that produced them, so the ratio barely
+moves. Dividing by desk hours means using the mouse less actually shows up,
+and it can't be gamed by working a shorter day.
+
+Once there is a fortnight of history the panel shows:
+
+| | |
+|---|---|
+| **Your normal** | The median of your qualifying days. Median, not mean, so one afternoon of dragging windows around does not redefine normal. |
+| **Streak under it** | Consecutive days below your own baseline. Days away from the machine are skipped, not counted as failures. |
+| **Best day** | The lowest score you have posted. |
+| **This week vs last** | The timescale a habit actually shows up on. |
+
+A day needs at least two desk hours before it is scored — a ten-minute evening
+check-in would otherwise post a wild number in either direction. The streak
+count appears in the bar next to the distance once it reaches two days.
+
+## Accuracy, honestly
+
+**These are estimates, not measurements.** Treat them as a consistent yardstick
+for comparing your own days, not as physical distance to three decimals:
+
+- DPI calibration is a hand-drag against a ruler. The averaging helps, but a
+  few percent of error survives it.
+- Optical sensors vary with surface, lift height and hand speed. The same
+  centimetre of mousepad does not always produce the same count.
+- Mice with a hardware DPI button switch resolution invisibly to the kernel;
+  everything recorded at the other setting is off by that ratio.
+- Distance is summed per input report, so a flick fast enough to cover ground
+  between two reports is measured as the straight line between them.
+- Movement before login, or while the tracker is stopped, is not counted at all.
+
+What it *is* good for: the shape of your day, whether this week is lighter than
+last, and whether a change to your workflow actually moved the number.
 
 ## Dependencies
 

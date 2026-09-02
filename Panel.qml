@@ -37,6 +37,15 @@ Panel {
   readonly property bool stale: hostWidget ? hostWidget.stale : true
   readonly property bool hasData: !!(hostWidget && hostWidget.stats)
 
+  readonly property bool gamify: hostWidget ? hostWidget.gamify : false
+  readonly property bool introSeen: hostWidget ? hostWidget.introSeen : true
+  readonly property real todayScore: hostWidget ? hostWidget.todayScore : 0
+  readonly property real baselineScore: hostWidget ? hostWidget.baselineScore : 0
+  readonly property int streakDays: hostWidget ? hostWidget.streakDays : 0
+  readonly property var best: hostWidget ? hostWidget.best : null
+  readonly property var weekly: Format.weekOverWeek(days)
+  readonly property string scoreDelta: Format.deltaArrow(todayScore, baselineScore)
+
   readonly property real fortnightAverage: Format.averageMeters(days, true)
   readonly property string deltaText: Format.deltaText(todayMeters, baselineMeters)
   readonly property bool improving: baselineMeters > 0 && todayMeters < baselineMeters
@@ -94,6 +103,74 @@ Panel {
         id: column
         width: parent.width
         spacing: Style.space(12)
+
+        // ---------- First run: what this is actually for ----------
+        Column {
+          id: intro
+          width: parent.width
+          spacing: Style.space(8)
+          visible: !root.introSeen
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "The number is supposed to go down"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "Omarchy is built to be driven from the keyboard, and this widget "
+                + "exists to show you how much you still reach for the mouse. Give it "
+                + "a week to learn what a normal day looks like for you, then aim under it."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "These are estimates, not measurements — see the note at the bottom."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Row {
+            spacing: Style.spacing.md
+
+            Button {
+              text: "Track my progress"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: if (root.hostWidget) root.hostWidget.enableGamify()
+            }
+
+            Button {
+              text: "Just the numbers"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: if (root.hostWidget) root.hostWidget.dismissIntro()
+            }
+          }
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+          visible: intro.visible
+        }
 
         // ---------- Hero: what today cost you ----------
         PanelHero {
@@ -174,6 +251,130 @@ Panel {
               height: parent.height
               radius: parent.radius
               color: root.todayMeters > root.goalMeters ? (root.bar ? root.bar.urgent : Color.urgent) : root.accent
+            }
+          }
+        }
+
+        // ---------- Progress ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+          visible: root.gamify
+
+          PanelSeparator { foreground: root.foreground }
+
+          PanelSectionHeader {
+            text: "Progress"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            visible: root.baselineScore <= 0
+            text: "Still learning your normal. A couple of full days at the machine "
+                + "and there will be a baseline to beat."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          // Today against your own median, which is the only comparison that
+          // means anything — nobody else's desk is your desk.
+          Item {
+            width: parent.width
+            height: Style.space(26)
+            visible: root.baselineScore > 0
+
+            Text {
+              id: scoreValue
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: Format.distance(root.todayScore, root.units) + " / desk hour"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.right: parent.right
+              textFormat: Text.PlainText
+              text: root.scoreDelta === "" ? "" : root.scoreDelta + " vs normal"
+              color: root.todayScore < root.baselineScore ? root.accent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(4)
+            radius: height / 2
+            visible: root.baselineScore > 0
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+            // The baseline is the full bar; today fills it and turns urgent
+            // once it runs past.
+            Rectangle {
+              width: Math.min(1, root.baselineScore > 0 ? root.todayScore / root.baselineScore : 0) * parent.width
+              height: parent.height
+              radius: parent.radius
+              color: root.todayScore > root.baselineScore
+                ? (root.bar ? root.bar.urgent : Color.urgent)
+                : root.accent
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.baselineScore > 0
+
+            Repeater {
+              model: [
+                { label: "Your normal", value: Format.distance(root.baselineScore, root.units) + " / desk hour" },
+                { label: "Streak under it", value: root.streakDays > 0
+                    ? root.streakDays + (root.streakDays === 1 ? " day" : " days") : "not yet" },
+                { label: "Best day", value: root.best
+                    ? Format.distance(root.best.score, root.units) + " on " + Format.shortDate(root.best.day.date)
+                    : "—" },
+                { label: "This week vs last", value: root.weekly
+                    ? (root.weekly.delta <= 0 ? "↓" : "↑") + Math.abs(Math.round(root.weekly.delta)) + "%"
+                    : "needs two weeks" }
+              ]
+
+              Row {
+                required property var modelData
+                width: parent.width
+
+                Text {
+                  id: progressLabel
+                  textFormat: Text.PlainText
+                  text: modelData.label
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Item {
+                  width: Math.max(Style.space(8), parent.width - progressLabel.implicitWidth - progressValue.implicitWidth)
+                  height: 1
+                }
+
+                Text {
+                  id: progressValue
+                  textFormat: Text.PlainText
+                  text: modelData.value
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
             }
           }
         }
@@ -379,6 +580,20 @@ Panel {
               }
             }
           }
+        }
+
+        // A standing caveat, not just a first-run one: these are estimates and
+        // the panel should never let anyone forget it.
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Estimated from sensor counts, not measured. Calibration, surface and "
+              + "hand speed all move the number — good for comparing your own days, "
+              + "not for quoting to three decimals."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         Text {

@@ -38,6 +38,9 @@ BarWidget {
   // set autostart false and the panel's "Start tracker" button is the only
   // thing that will ever touch systemd.
   readonly property bool autostart: setting("autostart", true) !== false
+  // Progress tracking is opinionated, so it stays off until asked for.
+  readonly property bool gamify: setting("gamify", false) === true
+  readonly property bool introSeen: setting("introSeen", false) === true
 
   // ---- state, straight off the daemon's file
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
@@ -53,6 +56,13 @@ BarWidget {
   readonly property real totalMeters: stats && stats.total ? (Number(stats.total.meters) || 0) : 0
   // Yesterday back to day 7 — a baseline today can be judged against.
   readonly property real baselineMeters: Format.averageMeters(recent.slice(-8, -1), false)
+
+  // ---- progress: metres per desk hour, against your own fortnight
+  readonly property real todayScore: Format.perDeskHour(today)
+  readonly property real baselineScore: Format.baseline(recent, 14)
+  readonly property int streakDays: gamify ? Format.streak(recent, baselineScore) : 0
+  readonly property var best: Format.personalBest(recent)
+  readonly property bool underBaseline: baselineScore > 0 && todayScore > 0 && todayScore < baselineScore
 
   // ---- the graph
   readonly property var hourSeries: Format.hourlySeries(stats, graphPoints, now)
@@ -82,7 +92,12 @@ BarWidget {
     if (delta !== "") parts.push(delta + " vs the last 7 days")
     parts.push(graphMode === "days" ? "graph: last " + graphPoints + " days"
                                     : "graph: last " + graphPoints + " hours")
+    if (gamify && baselineScore > 0)
+      parts.push(Format.distance(todayScore, units) + "/desk hour vs "
+                 + Format.distance(baselineScore, units) + " normal")
+    if (streakDays >= 2) parts.push(streakDays + "-day streak under baseline")
     if (goalMeters > 0) parts.push("goal " + Format.distance(goalMeters, units))
+    parts.push("estimated, not measured")
     return parts.join(" · ")
   }
 
@@ -105,6 +120,9 @@ BarWidget {
   function cycleUnits() {
     persist({ units: units === "metric" ? "imperial" : "metric" })
   }
+
+  function dismissIntro() { persist({ introSeen: true }) }
+  function enableGamify() { persist({ gamify: true, introSeen: true }) }
 
   // Settings live in this widget's shell.json layout entry, so a choice made
   // by clicking is the choice that survives a restart.
@@ -258,6 +276,17 @@ BarWidget {
         color: button.active ? button.activeColor : button.foreground
         font.family: button.fontFamily
         font.pixelSize: button.fontSize
+        renderType: Text.NativeRendering
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: root.streakDays >= 2
+        anchors.verticalCenter: parent.verticalCenter
+        text: String.fromCodePoint(0xF0238) + root.streakDays
+        color: Color.accent
+        font.family: button.fontFamily
+        font.pixelSize: Style.font.caption
         renderType: Text.NativeRendering
       }
 
