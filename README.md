@@ -77,23 +77,53 @@ sudo usermod -aG input "$USER"    # then log out and back in
 ## Calibrate
 
 Distances are only as good as the DPI they are divided by, and the default
-guess is 1000. To measure yours:
+guess is 1000. Measuring yours takes a ruler and a minute:
 
 ```bash
-omarchy-mouse-odometer calibrate           # drag 20 cm along a ruler
-omarchy-mouse-odometer calibrate --cm 30   # longer drag, better accuracy
+omarchy-mouse-odometer calibrate
 ```
 
-Or set it directly if you already know it:
+It runs **three passes on each axis** and averages them, because one
+hand-drag carries real error — parallax at the start and stop marks, a lift,
+an uneven pace. Each pass reports its own reading so a bad one is obvious,
+and the spread is printed at the end; more than 5% disagreement means the
+number is not yet trustworthy and a longer drag will steady it.
+
+```bash
+omarchy-mouse-odometer calibrate --cm 30     # longer drag, less end-point error
+omarchy-mouse-odometer calibrate --repeat 5  # more passes
+omarchy-mouse-odometer calibrate --axis x    # one axis only
+```
+
+**Why both axes.** Most mice have a single square-resolution sensor, so
+horizontal and vertical come out the same and the reading is stored as one
+number. Plenty of gaming mice expose independent X and Y resolution, though,
+and there a single number would be silently wrong for vertical movement in
+proportion to how far a stroke leans that way. So it measures both, and
+stores them separately only when they differ by more than 3% — otherwise the
+difference is measurement noise and averaging is the honest answer.
+
+Each pass measures **net displacement**, not path length: a ruler records
+where the mouse ended up, so a wobble that goes out and comes back cancels,
+exactly as it does on the desk.
+
+Note that your *screens* play no part in this. DPI is a property of the mouse
+sensor — counts per inch of desk travelled — and the daemon reads those counts
+before the compositor turns them into cursor movement. Resolution, scaling and
+monitor count change nothing.
+
+If you already know the figure, set it directly:
 
 ```bash
 omarchy-mouse-odometer set-dpi 1600
-omarchy-mouse-odometer set-dpi 800 --device "Logitech"   # per-mouse
+omarchy-mouse-odometer set-dpi 800 --device "Logitech"    # per-mouse
+omarchy-mouse-odometer set-dpi 900 --axis y               # one axis
 omarchy-mouse-odometer restart
 ```
 
-Config lives in `~/.config/omarchy-mouse-odometer/config.json`; changing the
-DPI only affects distance recorded from then on.
+Config lives in `~/.config/omarchy-mouse-odometer/config.json`, as either a
+number or `{"x": 1600, "y": 900}`. Changing the DPI only affects distance
+recorded from then on.
 
 ## Commands
 

@@ -17,6 +17,10 @@
   parsing inside the compositor's shell process.
 - **State is metres, not counts.** Counts are kept for the record, but DPI can
   change, so distance is converted at write time and never recomputed.
+- **Divide each axis before the hypotenuse.** `hypot(dx/dpiX, dy/dpiY)`, never
+  `hypot(dx, dy)/dpi` — on a mouse with asymmetric resolution the second form
+  is wrong in proportion to how far the stroke leans towards the odd axis.
+  A DPI setting is a scalar *or* `{"x": n, "y": n}`; `as_axes()` normalises it.
 - **Buckets are three-way.** Day, all-time, and per-device. Route new counters
   through `Tracker.tally()` — an earlier version incremented only the day
   bucket and the all-time clicks silently stayed at zero.

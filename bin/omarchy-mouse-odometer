@@ -17,6 +17,7 @@ Membership in the `input` group is enough to read the devices; no root.
 """
 
 import argparse
+import statistics
 import datetime as dt
 import errno
 import json
@@ -40,6 +41,7 @@ DEFAULT_DPI = 1000
 RESCAN_SECONDS = 5.0     # catch a mouse being plugged in or waking up
 FLUSH_SECONDS = 15.0     # how often a dirty state file is written
 KEEP_DAYS = 400
+AXIS_TOLERANCE = 0.03    # below this, X and Y are one sensor and one number
 UNIT_NAME = "omarchy-mouse-odometer.service"
 HOURLY_KEEP_DAYS = 7     # hour-by-hour detail is a recent-history luxury
 SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
@@ -97,9 +99,14 @@ class Device:
         self.name = name
         self.path = path
         self.fd = fd
-        self.dpi = dpi
+        self.dpi_x, self.dpi_y = dpi if isinstance(dpi, tuple) else (dpi, dpi)
         self.dx = 0
         self.dy = 0
+
+    @property
+    def dpi(self):
+        """The headline number, for logs and for the symmetric common case."""
+        return self.dpi_x if self.dpi_x == self.dpi_y else (self.dpi_x + self.dpi_y) / 2
 
 
 # ------------------------------------------------------------ config/state
@@ -126,18 +133,38 @@ def save_config(config):
     write_atomic(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
 
 
+def as_axes(value, fallback):
+    """A DPI setting is either one number or {"x": n, "y": n}.
+
+    Most mice have one square-resolution sensor, so a scalar is the common
+    case; gaming mice that expose independent axes get the pair.
+    """
+    if isinstance(value, dict):
+        try:
+            return (max(1.0, float(value.get("x", fallback))),
+                    max(1.0, float(value.get("y", fallback))))
+        except (TypeError, ValueError):
+            return (fallback, fallback)
+    try:
+        single = max(1.0, float(value))
+        return (single, single)
+    except (TypeError, ValueError):
+        return (fallback, fallback)
+
+
 def dpi_for(config, name):
     """A per-device DPI wins over the global one; mice differ wildly."""
+    try:
+        default = max(1.0, float(config.get("dpi", DEFAULT_DPI)))
+    except (TypeError, ValueError):
+        default = float(DEFAULT_DPI)
+    if isinstance(config.get("dpi"), dict):
+        default = as_axes(config.get("dpi"), float(DEFAULT_DPI))[0]
+
     for pattern, value in (config.get("devices") or {}).items():
         if pattern.strip().lower() in name.lower():
-            try:
-                return max(1.0, float(value))
-            except (TypeError, ValueError):
-                pass
-    try:
-        return max(1.0, float(config.get("dpi", DEFAULT_DPI)))
-    except (TypeError, ValueError):
-        return float(DEFAULT_DPI)
+            return as_axes(value, default)
+    return as_axes(config.get("dpi", DEFAULT_DPI), float(DEFAULT_DPI))
 
 
 def blank_bucket():
@@ -273,6 +300,11 @@ class Tracker:
     def device_bucket(self, device):
         bucket = self.state["devices"].setdefault(device.name, blank_bucket())
         bucket["dpi"] = device.dpi
+        if device.dpi_x != device.dpi_y:
+            bucket["dpiX"], bucket["dpiY"] = device.dpi_x, device.dpi_y
+        else:
+            bucket.pop("dpiX", None)
+            bucket.pop("dpiY", None)
         return bucket
 
     def tally(self, seconds, device, field, amount):
@@ -297,8 +329,11 @@ class Tracker:
                     print("mouse-odometer: %s: %s" % (path, error), file=sys.stderr)
                 continue
             self.devices[path] = Device(name, path, fd, dpi_for(self.config, name))
-            print("mouse-odometer: tracking %s (%s, %g dpi)"
-                  % (name, path, self.devices[path].dpi), file=sys.stderr)
+            device = self.devices[path]
+            resolution = ("%g dpi" % device.dpi_x if device.dpi_x == device.dpi_y
+                          else "%g x %g dpi" % (device.dpi_x, device.dpi_y))
+            print("mouse-odometer: tracking %s (%s, %s)"
+                  % (name, path, resolution), file=sys.stderr)
 
         for path in [p for p in self.devices if p not in live]:
             self.drop(path)
@@ -346,9 +381,13 @@ class Tracker:
         """One SYN_REPORT of motion: add its straight-line hop to the path."""
         if not device.dx and not device.dy:
             return
+        # Counts are kept raw for the record, but the conversion to distance
+        # divides each axis by its own resolution before the hypotenuse — on a
+        # mouse with asymmetric DPI, scaling the diagonal by one number is
+        # wrong in proportion to how far it leans towards the odd axis.
         counts = math.hypot(device.dx, device.dy)
+        meters = math.hypot(device.dx / device.dpi_x, device.dy / device.dpi_y) * INCH_M
         device.dx = device.dy = 0
-        meters = counts / device.dpi * INCH_M
 
         day = self.bucket(seconds)
         for bucket in (day, self.state["total"], self.device_bucket(device)):
@@ -486,8 +525,10 @@ def cmd_status(args):
         print()
         for name, bucket in sorted((state.get("devices") or {}).items(),
                                    key=lambda item: -float(item[1].get("meters", 0))):
-            print("  %-34s %10s at %g dpi"
-                  % (name, format_distance(bucket.get("meters", 0), units), bucket.get("dpi", DEFAULT_DPI)))
+            resolution = ("%g x %g dpi" % (bucket["dpiX"], bucket["dpiY"])
+                          if bucket.get("dpiX") else "%g dpi" % bucket.get("dpi", DEFAULT_DPI))
+            print("  %-34s %10s at %s"
+                  % (name, format_distance(bucket.get("meters", 0), units), resolution))
     return 0
 
 
@@ -503,6 +544,72 @@ def cmd_devices(_args):
     return 0
 
 
+COMMON_DPI = (400, 500, 800, 1000, 1200, 1600, 2000, 2400, 3200)
+AXES = {"x": ("horizontal", "to the right"), "y": ("vertical", "away from you, up the desk")}
+
+
+def measure_drag(fd):
+    """One drag: the net displacement on each axis, in counts.
+
+    Net rather than path length on purpose — a ruler measures where the mouse
+    ended up, so a wobble that goes out and comes back should cancel, exactly
+    as it does on the desk.
+    """
+    dx = dy = 0
+    while True:
+        ready, _, _ = select.select([fd, sys.stdin], [], [])
+        if sys.stdin in ready:
+            sys.stdin.readline()
+            return dx, dy
+        try:
+            data = os.read(fd, EVENT.size * 256)
+        except BlockingIOError:
+            continue
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _s, _u, kind, code, value = EVENT.unpack_from(data, offset)
+            if kind == EV_REL and code == REL_X:
+                dx += value
+            elif kind == EV_REL and code == REL_Y:
+                dy += value
+
+
+def nearest_common(dpi):
+    closest = min(COMMON_DPI, key=lambda candidate: abs(candidate - dpi))
+    return closest if abs(closest - dpi) / dpi <= 0.04 else None
+
+
+def calibrate_axis(fd, axis, distance_cm, passes):
+    """Repeat the same drag and average it — one hand-drag carries real error."""
+    name, direction = AXES[axis]
+    inches = distance_cm / 2.54
+    readings = []
+
+    print("\n%s axis — %d passes of %.1f cm, dragging %s."
+          % (name.capitalize(), passes, distance_cm, direction))
+    for attempt in range(1, passes + 1):
+        input("  pass %d/%d — Enter, drag, Enter again > " % (attempt, passes))
+        dx, dy = measure_drag(fd)
+        along, across = (dx, dy) if axis == "x" else (dy, dx)
+        counts = abs(along)
+        if counts < 10:
+            print("    barely moved (%d counts) — repeating this pass." % counts)
+            continue
+        dpi = counts / inches
+        drift = abs(across) / counts
+        readings.append(dpi)
+        print("    %d counts -> %.0f dpi%s"
+              % (counts, dpi, "   (%.0f%% off-axis drift)" % (drift * 100) if drift > 0.15 else ""))
+
+    if not readings:
+        return None
+    mean = statistics.mean(readings)
+    spread = (max(readings) - min(readings)) / mean if len(readings) > 1 else 0
+    print("  -> %.0f dpi (spread %.1f%%)" % (mean, spread * 100))
+    if spread > 0.05:
+        print("     Passes disagree by more than 5%; a longer drag gives a steadier number.")
+    return mean
+
+
 def cmd_calibrate(args):
     devices = pointer_devices()
     if args.device:
@@ -512,11 +619,11 @@ def cmd_calibrate(args):
         return 1
     name, path = devices[0]
 
+    axes = ["x", "y"] if args.axis == "both" else [args.axis]
     print("Calibrating: %s" % name)
-    print("Put the mouse on a ruler or the edge of a keyboard, note where it starts.")
-    print("Press Enter, drag it exactly %.1f cm in one smooth motion, then press Enter again."
+    print("Put the mouse against a ruler and note where it starts. Each pass:")
+    print("press Enter, drag %.1f cm in one smooth motion, press Enter again."
           % args.cm)
-    input("  ready > ")
 
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -524,51 +631,71 @@ def cmd_calibrate(args):
         print("Cannot read %s: %s" % (path, error), file=sys.stderr)
         return 1
 
-    counts, dx, dy = 0.0, 0, 0
+    results = {}
     try:
-        while True:
-            ready, _, _ = select.select([fd, sys.stdin], [], [])
-            if sys.stdin in ready:
-                sys.stdin.readline()
-                break
-            try:
-                data = os.read(fd, EVENT.size * 256)
-            except BlockingIOError:
-                continue
-            for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
-                _s, _u, kind, code, value = EVENT.unpack_from(data, offset)
-                if kind == EV_REL and code == REL_X:
-                    dx += value
-                elif kind == EV_REL and code == REL_Y:
-                    dy += value
-                elif kind == EV_SYN and code == SYN_REPORT:
-                    counts += math.hypot(dx, dy)
-                    dx = dy = 0
+        for axis in axes:
+            measured = calibrate_axis(fd, axis, args.cm, max(1, args.repeat))
+            if measured is None:
+                print("Nothing usable measured on the %s axis." % AXES[axis][0], file=sys.stderr)
+                return 1
+            results[axis] = measured
     finally:
         os.close(fd)
 
-    if counts < 10:
-        print("Barely any movement registered (%.0f counts) — try again." % counts, file=sys.stderr)
-        return 1
+    if len(results) == 2:
+        difference = abs(results["x"] - results["y"]) / statistics.mean(results.values())
+        print("\nHorizontal %.0f dpi, vertical %.0f dpi — %.1f%% apart."
+              % (results["x"], results["y"], difference * 100))
+        if difference > AXIS_TOLERANCE:
+            value = {"x": round(results["x"]), "y": round(results["y"])}
+            print("Far enough apart to be a real difference; storing the axes separately.")
+        else:
+            averaged = statistics.mean(results.values())
+            value = round(averaged)
+            print("Within measurement error of each other, as one square sensor should be;")
+            print("storing a single %d dpi." % value)
+    else:
+        axis = axes[0]
+        value = round(results[axis])
+        print("\n%.0f dpi on the %s axis." % (results[axis], AXES[axis][0]))
 
-    dpi = counts / (args.cm / 2.54)
-    print("\n%.0f counts over %.1f cm  ->  %.0f DPI" % (counts, args.cm, dpi))
-    print("(common values are 400, 800, 1000, 1200, 1600, 3200 — round to the nearest)")
+    if isinstance(value, int):
+        suggestion = nearest_common(value)
+        if suggestion and suggestion != value:
+            print("That is within 4%% of %d, a standard setting — rounding to it."
+                  % suggestion)
+            value = suggestion
 
-    if args.save or input("Save %.0f DPI for \"%s\"? [y/N] " % (dpi, name)).strip().lower() == "y":
-        config = load_config()
-        config["devices"][name] = round(dpi)
-        save_config(config)
-        print("Saved to %s. Restart the tracker: omarchy-mouse-odometer restart" % CONFIG_PATH)
+    shown = value if isinstance(value, int) else "x=%d y=%d" % (value["x"], value["y"])
+    if not args.save:
+        answer = input("Save %s for \"%s\"? [y/N] " % (shown, name)).strip().lower()
+        if answer != "y":
+            print("Not saved.")
+            return 0
+
+    config = load_config()
+    config["devices"][name] = value
+    save_config(config)
+    print("Saved to %s" % CONFIG_PATH)
+    cmd_restart(args)
     return 0
 
 
 def cmd_set_dpi(args):
     config = load_config()
-    if args.device:
-        config["devices"][args.device] = args.dpi
+    key = "devices" if args.device else None
+    if args.axis == "both":
+        value = args.dpi
     else:
-        config["dpi"] = args.dpi
+        existing = (config.get("devices", {}).get(args.device) if args.device
+                    else config.get("dpi", DEFAULT_DPI))
+        current_x, current_y = as_axes(existing, float(DEFAULT_DPI))
+        value = {"x": args.dpi if args.axis == "x" else current_x,
+                 "y": args.dpi if args.axis == "y" else current_y}
+    if args.device:
+        config["devices"][args.device] = value
+    else:
+        config["dpi"] = value
     save_config(config)
     print("Wrote %s" % CONFIG_PATH)
     print("Restart the tracker to pick it up: omarchy-mouse-odometer restart")
@@ -685,6 +812,9 @@ def main(argv):
 
     calibrate = subs.add_parser("calibrate", help="measure the real DPI of a mouse")
     calibrate.add_argument("--cm", type=float, default=20.0, help="distance you will drag (default 20)")
+    calibrate.add_argument("--repeat", type=int, default=3, help="passes per axis to average (default 3)")
+    calibrate.add_argument("--axis", choices=["x", "y", "both"], default="both",
+                           help="which axis to measure (default both)")
     calibrate.add_argument("--device", help="device name substring")
     calibrate.add_argument("--save", action="store_true", help="save without asking")
     calibrate.set_defaults(func=cmd_calibrate)
@@ -692,6 +822,8 @@ def main(argv):
     setdpi = subs.add_parser("set-dpi", help="record a known DPI")
     setdpi.add_argument("dpi", type=float)
     setdpi.add_argument("--device", help="device name substring (default: all mice)")
+    setdpi.add_argument("--axis", choices=["x", "y", "both"], default="both",
+                        help="set one axis only (default both)")
     setdpi.set_defaults(func=cmd_set_dpi)
 
     bootstrap = subs.add_parser("bootstrap", help="install and start the tracker service")
