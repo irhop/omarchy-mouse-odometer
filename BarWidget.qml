@@ -142,8 +142,16 @@ BarWidget {
   function ensureTracker() {
     if (!bar || bootstrapped || !autostart) return
     bootstrapped = true
-    bar.run(bar.shellQuote(Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", ""))
+    bar.run(root.shellQuote(Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", ""))
             + " bootstrap >/dev/null 2>&1")
+  }
+
+  // Bars do not all expose shellQuote — the one shipped with 4.0.0.alpha
+  // documents it but does not define it, and calling it there threw before
+  // the tracker was ever installed. Quoting is three lines; owning them
+  // beats depending on the host for it.
+  function shellQuote(value) {
+    return "'" + String(value).replace(/'/g, "'\\''") + "'"
   }
 
   property bool bootstrapped: false

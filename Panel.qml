@@ -15,6 +15,15 @@ Panel {
 
   property var anchorItem: null
   property var hostWidget: null
+
+  // The panel sits beside the CLI, so "Start tracker" bootstraps the same way
+  // the widget does. Calling systemctl directly assumed the unit was already
+  // linked, which on a machine that never bootstrapped is exactly the case
+  // the button exists to fix.
+  function trackerBin() {
+    var path = Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", "")
+    return "'" + path.replace(/'/g, "'\\''") + "'"
+  }
   readonly property var barIdentity: hostWidget || root
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -651,7 +660,7 @@ Panel {
             fontFamily: root.fontFamily
             fontSize: Style.font.bodySmall
             onClicked: {
-              if (root.bar) root.bar.run("systemctl --user enable --now omarchy-mouse-odometer.service")
+              if (root.bar) root.bar.run(root.trackerBin() + " bootstrap")
               if (root.hostWidget) Qt.callLater(root.hostWidget.reload)
             }
           }
