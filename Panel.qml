@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Commons
 import qs.Ui
@@ -74,6 +75,7 @@ Panel {
   onOpenedChanged: if (opened) {
     hoverIndex = -1
     hourHover = -1
+    if (panelFlick) panelFlick.contentY = 0
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -91,6 +93,11 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0)
+          panelFlick.contentY = Math.max(0, Math.min(panelFlick.contentY + dy * Style.space(56),
+                                                     Math.max(0, panelFlick.contentHeight - panelFlick.height)))
+      }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onActivateRequested: if (root.hostWidget) root.hostWidget.reload()
@@ -99,9 +106,20 @@ Panel {
         else if (key === "r" || key === "R") { if (root.hostWidget) root.hostWidget.reload() }
       }
 
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
       Column {
         id: column
-        width: parent.width
+        width: panelFlick.width
         spacing: Style.space(12)
 
         // ---------- First run: what this is actually for ----------
@@ -541,7 +559,8 @@ Panel {
 
           readonly property var entries: [
             { label: "This week", value: Format.distance(root.weekMeters, root.units) },
-            { label: "Daily average", value: Format.distance(root.fortnightAverage, root.units) },
+            { label: "Daily average", value: root.fortnightAverage > 0
+                ? Format.distance(root.fortnightAverage, root.units) : "needs a few days" },
             { label: "Clicks today", value: Format.count(root.today ? root.today.clicks : 0) },
             { label: "Scrolled today", value: Format.count(root.today ? root.today.scrolls : 0) + " ticks" },
             { label: "Active mousing", value: Format.duration(root.today ? root.today.activeSeconds : 0) },
@@ -637,6 +656,7 @@ Panel {
             }
           }
         }
+      }
       }
     }
   }
