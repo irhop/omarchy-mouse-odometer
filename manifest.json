@@ -5,8 +5,10 @@
   "version": "1.1.0",
   "author": "odin",
   "license": "MIT",
-  "description": "A live graph of how far your mouse has actually travelled — today, this week, all time.",
-  "kinds": ["bar-widget"],
+  "description": "A live graph of how far your mouse has actually travelled \u2014 today, this week, all time.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
@@ -24,7 +26,8 @@
       "graphBarWidth": 2,
       "showDelta": true,
       "showNumber": true,
-      "goalMeters": 0
+      "goalMeters": 0,
+      "autostart": true
     },
     "schema": [
       {
@@ -71,7 +74,7 @@
         "key": "showDelta",
         "type": "boolean",
         "label": "Show trend arrow",
-        "description": "Today against the last seven days, as ↓12% / ↑8%",
+        "description": "Today against the last seven days, as \u219312% / \u21918%",
         "defaultValue": true
       },
       {
@@ -90,6 +93,13 @@
         "max": 100000,
         "step": 50,
         "defaultValue": 0
+      },
+      {
+        "key": "autostart",
+        "type": "boolean",
+        "label": "Install the tracker automatically",
+        "description": "On first load, install and start the omarchy-mouse-odometer user service. Turn off to start it yourself.",
+        "defaultValue": true
       }
     ]
   }

@@ -616,7 +616,25 @@ def cmd_bootstrap(args):
               % os.environ.get("USER", "$USER"), file=sys.stderr)
 
     os.system("systemctl --user daemon-reload")
-    return os.system("systemctl --user enable --now " + UNIT_NAME) >> 8
+    status = os.system("systemctl --user enable --now " + UNIT_NAME) >> 8
+    if status == 0 and not args.quiet:
+        notify("Mouse Odometer",
+               "Tracker service installed and started. Disable it any time with "
+               "`systemctl --user disable --now %s`." % UNIT_NAME)
+    return status
+
+
+def notify(title, body):
+    """Best-effort desktop notification; never fail the caller over it."""
+    for command in ("omarchy-notification-send", "notify-send"):
+        if os.system("command -v %s >/dev/null 2>&1" % command) == 0:
+            os.system("%s %s %s >/dev/null 2>&1"
+                      % (command, shell_quote(title), shell_quote(body)))
+            return
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
 
 
 def in_input_group():
@@ -678,6 +696,7 @@ def main(argv):
 
     bootstrap = subs.add_parser("bootstrap", help="install and start the tracker service")
     bootstrap.add_argument("--force", action="store_true", help="re-link even when already running")
+    bootstrap.add_argument("--quiet", action="store_true", help="skip the desktop notification")
     bootstrap.set_defaults(func=cmd_bootstrap)
 
     subs.add_parser("restart", help="restart the tracker service").set_defaults(func=cmd_restart)

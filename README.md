@@ -50,6 +50,23 @@ plugin is the only step. If you cloned it by hand instead:
 ~/.config/omarchy/plugins/odin.mouse-odometer/install.sh
 ```
 
+### What it installs
+
+The widget is a reader; the measuring is done by a small user service, so it
+keeps counting when the shell restarts. On first load the widget runs
+`bin/omarchy-mouse-odometer bootstrap`, which:
+
+- symlinks `systemd/omarchy-mouse-odometer.service` into `~/.config/systemd/user/`
+  and starts it with `systemctl --user enable --now`
+- symlinks the CLI into `~/.local/bin/` if that directory exists
+- posts a desktop notification saying it has done so
+
+Nothing runs as root, nothing is written outside those paths plus its own
+state and config files, and no sudoers rule is touched. Set `autostart` to
+`false` on the widget if you would rather start the service yourself — the
+panel has a **Start tracker** button, and `install.sh` does the same job. To
+undo all of it, see [Uninstall](#uninstall).
+
 Reading the mouse needs membership in the `input` group and nothing more — no
 root, no compositor hooks. If `id -nG` does not list `input`:
 
@@ -110,6 +127,7 @@ with `omarchy bar set`:
 | `showDelta` | `true` | The ↓12% trend arrow |
 | `showNumber` | `true` | Turn off for a graph-only widget |
 | `goalMeters` | `0` | Daily budget in metres; the widget turns urgent above it |
+| `autostart` | `true` | Install and start the tracker service on first load |
 | `icon` | `󰍽` | Glyph in front of the graph |
 
 ```json
@@ -135,6 +153,19 @@ move into the tooltip and the panel.
 The daemon holds one file descriptor per mouse and wakes only when the mouse
 moves. Daily history is kept for 400 days; the hour-by-hour detail behind the
 graph is kept for 7 and then rolls off, so the state file stays small.
+
+## Dependencies
+
+None beyond a stock Omarchy system:
+
+| Needs | Why |
+|---|---|
+| Python 3 (standard library only) | The tracker daemon and CLI. No pip packages, no build step. |
+| systemd user session | Keeps the tracker running across shell restarts. |
+| Membership of the `input` group | Reading `/dev/input/event*`. Standard on Omarchy. |
+
+It makes no network requests of any kind, bundles no binaries, and builds
+nothing at install time.
 
 ## Limitations
 

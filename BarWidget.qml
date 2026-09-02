@@ -34,6 +34,10 @@ BarWidget {
   readonly property bool showNumber: setting("showNumber", true) !== false
   readonly property real goalMeters: Math.max(0, Number(setting("goalMeters", 0)) || 0)
   readonly property string icon: String(setting("icon", String.fromCodePoint(0xF037D)))
+  // Installing a user service on first load is convenient but opinionated;
+  // set autostart false and the panel's "Start tracker" button is the only
+  // thing that will ever touch systemd.
+  readonly property bool autostart: setting("autostart", true) !== false
 
   // ---- state, straight off the daemon's file
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
@@ -118,7 +122,7 @@ BarWidget {
   // counting while the widget is not even loaded. Bootstrapping it from here
   // means installing the plugin is the only step a new user has to take.
   function ensureTracker() {
-    if (!bar || bootstrapped) return
+    if (!bar || bootstrapped || !autostart) return
     bootstrapped = true
     bar.run(bar.shellQuote(Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", ""))
             + " bootstrap >/dev/null 2>&1")
