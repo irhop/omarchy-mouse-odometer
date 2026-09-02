@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "odin.mouse-odometer",
+  "id": "io.github.irhop.mouse-odometer",
   "name": "Mouse Odometer",
   "version": "1.1.0",
-  "author": "odin",
+  "author": "irhop",
   "license": "MIT",
   "description": "A live graph of how far your mouse has actually travelled \u2014 today, this week, all time.",
   "kinds": [

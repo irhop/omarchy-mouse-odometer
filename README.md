@@ -40,14 +40,14 @@ reflects technique rather than how long you sat at the desk.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-mouse-odometer.git --enable --yes
+omarchy plugin add https://github.com/irhop/omarchy-mouse-odometer.git --enable --yes
 ```
 
 The widget bootstraps its own tracker the first time it loads — installing the
 plugin is the only step. If you cloned it by hand instead:
 
 ```bash
-~/.config/omarchy/plugins/odin.mouse-odometer/install.sh
+~/.config/omarchy/plugins/io.github.irhop.mouse-odometer/install.sh
 ```
 
 ### What it installs
@@ -131,7 +131,7 @@ with `omarchy bar set`:
 | `icon` | `󰍽` | Glyph in front of the graph |
 
 ```json
-{ "id": "odin.mouse-odometer", "graph": "hours", "graphPoints": 24, "goalMeters": 300 }
+{ "id": "io.github.irhop.mouse-odometer", "graph": "hours", "graphPoints": 24, "goalMeters": 300 }
 ```
 
 A goal is the part that actually changes behaviour: pick a number a little
@@ -182,7 +182,7 @@ nothing at install time.
 ```bash
 systemctl --user disable --now omarchy-mouse-odometer.service
 rm ~/.config/systemd/user/omarchy-mouse-odometer.service ~/.local/bin/omarchy-mouse-odometer
-omarchy plugin remove odin.mouse-odometer
+omarchy plugin remove io.github.irhop.mouse-odometer
 rm -rf ~/.local/state/omarchy-mouse-odometer ~/.config/omarchy-mouse-odometer
 ```
 

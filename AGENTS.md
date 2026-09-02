@@ -36,7 +36,7 @@ history for the harness. The struct is `struct.Struct("llHHi")`, 24 bytes on
 Check QML changes with:
 
 ```bash
-omarchy plugin validate ~/.config/omarchy/plugins/odin.mouse-odometer
+omarchy plugin validate ~/.config/omarchy/plugins/io.github.irhop.mouse-odometer
 omarchy-shell shell rescanPlugins
 qs -p /usr/share/omarchy/shell log | grep -i odometer
 ```

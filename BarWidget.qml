@@ -16,7 +16,7 @@ import "Format.js" as Format
 // cycles the graph between the last hours, the last days, and off.
 BarWidget {
   id: root
-  moduleName: "odin.mouse-odometer"
+  moduleName: "io.github.irhop.mouse-odometer"
 
   // ---- settings (shell.json layout entry, `omarchy bar set`)
   readonly property string units: String(setting("units", "metric")) === "imperial" ? "imperial" : "metric"
@@ -190,7 +190,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "odin.mouse-odometer"
+    target: "io.github.irhop.mouse-odometer"
 
     function refresh(): void { root.broadcast("reload") }
     function open(): void { root.open() }

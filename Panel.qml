@@ -9,7 +9,7 @@ import "Format.js" as Format
 // the mouse less than I was?" — so every number is framed against a baseline.
 Panel {
   id: root
-  moduleName: "odin.mouse-odometer"
+  moduleName: "io.github.irhop.mouse-odometer"
   manageIpc: false
 
   property var anchorItem: null

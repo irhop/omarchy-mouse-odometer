@@ -4,7 +4,7 @@
 # bootstraps itself on first load — but running it by hand is equivalent.
 set -euo pipefail
 
-PLUGIN_ID="odin.mouse-odometer"
+PLUGIN_ID="io.github.irhop.mouse-odometer"
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 "$PLUGIN_DIR/bin/omarchy-mouse-odometer" bootstrap --force
