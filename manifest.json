@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.irhop.mouse-odometer",
   "name": "Mouse Odometer",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "irhop",
   "license": "MIT",
   "description": "A live graph of how far your mouse has actually travelled \u2014 today, this week, all time.",
@@ -27,7 +27,6 @@
       "showDelta": true,
       "showNumber": true,
       "goalMeters": 0,
-      "autostart": true,
       "gamify": false
     },
     "schema": [
@@ -94,13 +93,6 @@
         "max": 100000,
         "step": 50,
         "defaultValue": 0
-      },
-      {
-        "key": "autostart",
-        "type": "boolean",
-        "label": "Install the tracker automatically",
-        "description": "On first load, install and start the omarchy-mouse-odometer user service. Turn off to start it yourself.",
-        "defaultValue": true
       },
       {
         "key": "gamify",

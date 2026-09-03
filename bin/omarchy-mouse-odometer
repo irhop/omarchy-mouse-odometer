@@ -26,8 +26,10 @@ import json
 import math
 import os
 import select
+import shutil
 import signal
 import struct
+import subprocess
 import sys
 import time
 
@@ -85,6 +87,70 @@ STATE_PATH = os.path.join(STATE_DIR, "state.json")
 CONFIG_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
     "omarchy-mouse-odometer", "config.json")
+
+
+# ------------------------------------------------------------- subprocesses
+#
+# Everything this tool shells out to is part of installing or controlling a
+# user service, and it can be reached from a bar widget, which inherits
+# whatever environment the compositor was started with. So no command runs
+# through a shell, every executable is resolved against a fixed PATH rather
+# than an inherited one, and the environment is built from nothing: only the
+# handful of variables `systemctl --user` and a notification daemon actually
+# need are carried across.
+SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+# XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are how `systemctl --user`
+# finds the session manager. Without them it has nothing to talk to.
+ENV_KEEP = ("HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CONFIG_HOME", "XDG_STATE_HOME", "WAYLAND_DISPLAY", "DISPLAY")
+
+
+def tool_path(name):
+    """Absolute path of an external tool, looked up only on SAFE_PATH."""
+    return shutil.which(name, path=SAFE_PATH)
+
+
+def minimal_env():
+    env = {"PATH": SAFE_PATH, "LC_ALL": "C"}
+    for key in ENV_KEEP:
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+def run_tool(name, args, keep_stderr=True):
+    """Run one external tool by absolute path, no shell, minimal environment.
+
+    Returns (status, output). A tool that is not installed comes back as 127
+    with empty output, which is what every caller here already reads as "no".
+    `keep_stderr` folds the error stream into the output, which is what makes
+    a failed systemctl reportable; the DPI probes turn it off so that a
+    diagnostic can never be mistaken for a reading.
+    """
+    binary = tool_path(name)
+    if not binary:
+        return 127, ""
+    try:
+        done = subprocess.run(
+            [binary] + list(args), env=minimal_env(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if keep_stderr else subprocess.DEVNULL,
+            universal_newlines=True)
+    except OSError:
+        return 127, ""
+    return done.returncode, done.stdout or ""
+
+
+def systemctl(*args):
+    return run_tool("systemctl", ("--user",) + args)
+
+
+def display_path(path):
+    """Paths are shown to the user before they consent to them, so show the
+    short form they would recognise rather than an absolute one."""
+    return "~" + path[len(HOME):] if path.startswith(HOME + os.sep) else path
 
 
 # ---------------------------------------------------------------- discovery
@@ -309,23 +375,20 @@ def parse_ratbag_dpi(blob):
 
 
 def hwdb_dpi(path):
-    return parse_hwdb_dpi(os.popen(
-        "udevadm info --query=property --name=%s 2>/dev/null" % shell_quote(path)).read())
+    return parse_hwdb_dpi(run_tool(
+        "udevadm", ["info", "--query=property", "--name=" + path], keep_stderr=False)[1])
 
 
 def ratbag_dpi(name):
     """libratbag knows the *live* setting, so it survives a DPI button press."""
-    if os.system("command -v ratbagctl >/dev/null 2>&1") != 0:
+    if not tool_path("ratbagctl"):
         return None
-    try:
-        for line in os.popen("ratbagctl list 2>/dev/null").read().splitlines():
-            handle, _, label = line.partition(":")
-            if not handle.strip() or label.strip().lower() not in name.lower():
-                continue
-            return parse_ratbag_dpi(os.popen(
-                "ratbagctl %s dpi get 2>/dev/null" % shell_quote(handle.strip())).read())
-    except OSError:
-        return None
+    for line in run_tool("ratbagctl", ["list"], keep_stderr=False)[1].splitlines():
+        handle, _, label = line.partition(":")
+        if not handle.strip() or label.strip().lower() not in name.lower():
+            continue
+        return parse_ratbag_dpi(run_tool(
+            "ratbagctl", [handle.strip(), "dpi", "get"], keep_stderr=False)[1])
     return None
 
 
@@ -1056,68 +1119,195 @@ def cmd_set_dpi(args):
     return 0
 
 
+def install_paths():
+    """Every path bootstrap touches, resolved once so the plan and the run
+    cannot disagree about what "it" is."""
+    plugin_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                            "systemd", "user")
+    bin_dir = os.path.join(HOME, ".local", "bin")
+    return {
+        "unit_source": os.path.join(plugin_dir, "systemd", UNIT_NAME),
+        "unit_dir": unit_dir,
+        "unit_link": os.path.join(unit_dir, UNIT_NAME),
+        "cli_source": os.path.realpath(__file__),
+        "bin_dir": bin_dir,
+        "cli_link": os.path.join(bin_dir, "omarchy-mouse-odometer"),
+    }
+
+
+def bootstrap_plan(paths=None):
+    """The changes `bootstrap` would make, in the order it makes them.
+
+    The panel prints this on its consent screen and `--dry-run` prints it to a
+    terminal, so what the user agrees to is the list the installer walks
+    rather than a prose description of it that can quietly drift.
+    """
+    paths = paths or install_paths()
+    steps = []
+    if os.path.realpath(paths["unit_link"]) != paths["unit_source"]:
+        steps.append("Link the service unit into %s" % display_path(paths["unit_dir"]))
+    if os.path.isdir(paths["bin_dir"]) and \
+            os.path.realpath(paths["cli_link"]) != paths["cli_source"]:
+        steps.append("Link the CLI as %s" % display_path(paths["cli_link"]))
+    steps.append("Reload the systemd user manager")
+    steps.append("Enable and start %s, which reads /dev/input/event* for pointer "
+                 "motion and starts again at every login" % UNIT_NAME)
+    return steps
+
+
+def relink(link, target):
+    """Point a symlink at target, replacing whatever is there."""
+    if os.path.realpath(link) == os.path.realpath(target):
+        return False
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(target, link)
+    return True
+
+
 def cmd_bootstrap(args):
-    """Install and start the user service. Idempotent, and safe to call from
-    the widget: a plugin installed with `omarchy plugin add` never gets to run
-    an install script, so the bar has to be able to set itself up."""
-    active = os.popen("systemctl --user is-active omarchy-mouse-odometer.service 2>/dev/null").read().strip()
-    if active == "active" and not args.force:
+    """Install and start the user service.
+
+    Nothing reaches this on its own. Enabling the plugin must not enable a
+    service, so the widget never calls it; the panel does, once, after showing
+    `bootstrap_plan()` and being told to go ahead. It is still idempotent,
+    because the button that runs it is exactly the button someone presses
+    twice.
+    """
+    paths = install_paths()
+
+    if args.dry_run:
+        for step in bootstrap_plan(paths):
+            print(step)
+        return 0
+
+    if tracker_active() and not args.force:
         print("Tracker already running.")
         return 0
 
-    plugin_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    unit_source = os.path.join(plugin_dir, "systemd", UNIT_NAME)
-    if not os.path.exists(unit_source):
-        print("Cannot find %s" % unit_source, file=sys.stderr)
+    if not os.path.exists(paths["unit_source"]):
+        print("Cannot find %s" % paths["unit_source"], file=sys.stderr)
         return 1
 
-    unit_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
-                            "systemd", "user")
-    os.makedirs(unit_dir, exist_ok=True)
-    unit_link = os.path.join(unit_dir, UNIT_NAME)
-    if os.path.realpath(unit_link) != unit_source:
-        if os.path.lexists(unit_link):
-            os.unlink(unit_link)
-        os.symlink(unit_source, unit_link)
+    os.makedirs(paths["unit_dir"], exist_ok=True)
+    relink(paths["unit_link"], paths["unit_source"])
+    print("Linked %s" % display_path(paths["unit_link"]))
 
     # A CLI on PATH is the difference between a tool and a background process.
-    bin_dir = os.path.join(HOME, ".local", "bin")
-    if os.path.isdir(bin_dir):
-        link = os.path.join(bin_dir, "omarchy-mouse-odometer")
-        target = os.path.realpath(__file__)
-        if os.path.realpath(link) != target:
-            if os.path.lexists(link):
-                os.unlink(link)
-            os.symlink(target, link)
+    if os.path.isdir(paths["bin_dir"]):
+        relink(paths["cli_link"], paths["cli_source"])
+        print("Linked %s" % display_path(paths["cli_link"]))
+
+    status, output = systemctl("daemon-reload")
+    if status != 0:
+        print("systemctl --user daemon-reload failed (%d)" % status, file=sys.stderr)
+        if output.strip():
+            print(output.strip(), file=sys.stderr)
+        return status
+
+    status, output = systemctl("enable", "--now", UNIT_NAME)
+    if status != 0:
+        print("Could not start %s (systemctl exited %d)." % (UNIT_NAME, status), file=sys.stderr)
+        if output.strip():
+            print(output.strip(), file=sys.stderr)
+        return status
+    print("Started %s." % UNIT_NAME)
 
     if not in_input_group():
-        print("Warning: you are not in the 'input' group, so the tracker cannot read the mouse.",
-              file=sys.stderr)
+        # Worth saying loudly: the service is up and will still measure nothing.
+        print("The tracker is running but cannot read the mouse — you are not in the "
+              "'input' group.", file=sys.stderr)
         print("  sudo usermod -aG input %s   (then log out and back in)"
               % os.environ.get("USER", "$USER"), file=sys.stderr)
 
-    os.system("systemctl --user daemon-reload")
-    status = os.system("systemctl --user enable --now " + UNIT_NAME) >> 8
-    if status == 0 and not args.quiet:
+    if not args.quiet:
         notify("Mouse Odometer is running",
                "Omarchy is built to be driven from the keyboard, so the point of "
                "this is to watch the number go down. Give it a week to learn your "
                "baseline. Distances are an estimate, not a measurement \u2014 run "
                "`omarchy-mouse-odometer calibrate` to make them yours.")
-    return status
+    return 0
+
+
+def uninstall_plan(paths=None, purge=False):
+    """What `uninstall` would remove, on this machine, right now."""
+    paths = paths or install_paths()
+    steps = ["Stop and disable %s" % UNIT_NAME]
+    if os.path.lexists(paths["unit_link"]):
+        steps.append("Remove %s" % display_path(paths["unit_link"]))
+    if os.path.islink(paths["cli_link"]) and \
+            os.path.realpath(paths["cli_link"]) == paths["cli_source"]:
+        steps.append("Remove %s" % display_path(paths["cli_link"]))
+    if purge:
+        steps.append("Delete %s — the recorded history" % display_path(STATE_DIR))
+        steps.append("Delete %s — the DPI settings"
+                     % display_path(os.path.dirname(CONFIG_PATH)))
+    return steps
+
+
+def cmd_uninstall(args):
+    """Undo what bootstrap did, and only that.
+
+    Anything this tool installs it has to be able to remove, or the honest
+    uninstall instructions are a list of paths in a README. The history and
+    the DPI figure survive unless --purge asks for them too: reinstalling and
+    silently losing a year of numbers is not an uninstall anyone wanted.
+    """
+    paths = install_paths()
+    steps = uninstall_plan(paths, args.purge)
+
+    if args.dry_run:
+        for step in steps:
+            print(step)
+        return 0
+
+    if not args.yes:
+        for step in steps:
+            print("  " + step)
+        if input("Proceed? [y/N] ").strip().lower() != "y":
+            return 1
+
+    # Only ever unlink what points back here; a same-named link to something
+    # else belongs to whoever made it.
+    ours = os.path.islink(paths["unit_link"]) and \
+        os.path.realpath(paths["unit_link"]) == paths["unit_source"]
+
+    systemctl("disable", "--now", UNIT_NAME)
+
+    # `disable` takes the unit symlink with it when the unit was linked in
+    # rather than installed, which is our case — so the file is usually gone
+    # by now. Report it either way: a plan that lists a removal and then says
+    # nothing about it reads as a step that silently failed.
+    if ours:
+        if os.path.lexists(paths["unit_link"]):
+            os.unlink(paths["unit_link"])
+        print("Removed %s" % display_path(paths["unit_link"]))
+
+    if os.path.islink(paths["cli_link"]) and \
+            os.path.realpath(paths["cli_link"]) == paths["cli_source"]:
+        os.unlink(paths["cli_link"])
+        print("Removed %s" % display_path(paths["cli_link"]))
+
+    systemctl("daemon-reload")
+
+    if args.purge:
+        for directory in (STATE_DIR, os.path.dirname(CONFIG_PATH)):
+            shutil.rmtree(directory, ignore_errors=True)
+            print("Deleted %s" % display_path(directory))
+    else:
+        print("Kept %s — pass --purge to delete the history too." % display_path(STATE_DIR))
+
+    print("Remove the widget itself with: omarchy plugin remove io.github.irhop.mouse-odometer")
+    return 0
 
 
 def notify(title, body):
     """Best-effort desktop notification; never fail the caller over it."""
     for command in ("omarchy-notification-send", "notify-send"):
-        if os.system("command -v %s >/dev/null 2>&1" % command) == 0:
-            os.system("%s %s %s >/dev/null 2>&1"
-                      % (command, shell_quote(title), shell_quote(body)))
+        if tool_path(command):
+            run_tool(command, [title, body])
             return
-
-
-def shell_quote(value):
-    return "'" + str(value).replace("'", "'\\''") + "'"
 
 
 def in_input_group():
@@ -1129,7 +1319,7 @@ def in_input_group():
 
 
 def tracker_active():
-    return os.popen("systemctl --user is-active %s 2>/dev/null" % UNIT_NAME).read().strip() == "active"
+    return systemctl("is-active", UNIT_NAME)[1].strip() == "active"
 
 
 def rewriting_state(rewrite):
@@ -1141,16 +1331,16 @@ def rewriting_state(rewrite):
     """
     running = tracker_active()
     if running:
-        os.system("systemctl --user stop " + UNIT_NAME)
+        systemctl("stop", UNIT_NAME)
     try:
         return rewrite()
     finally:
         if running:
-            os.system("systemctl --user start " + UNIT_NAME)
+            systemctl("start", UNIT_NAME)
 
 
 def cmd_restart(_args):
-    return os.system("systemctl --user restart omarchy-mouse-odometer.service") >> 8
+    return systemctl("restart", UNIT_NAME)[0]
 
 
 def cmd_reset(args):
@@ -1254,7 +1444,16 @@ def main(argv):
     bootstrap = subs.add_parser("bootstrap", help="install and start the tracker service")
     bootstrap.add_argument("--force", action="store_true", help="re-link even when already running")
     bootstrap.add_argument("--quiet", action="store_true", help="skip the desktop notification")
+    bootstrap.add_argument("--dry-run", action="store_true",
+                           help="print exactly what would change, and change nothing")
     bootstrap.set_defaults(func=cmd_bootstrap)
+
+    uninstall = subs.add_parser("uninstall", help="remove the service and links bootstrap installed")
+    uninstall.add_argument("--purge", action="store_true",
+                           help="also delete the recorded history and the DPI settings")
+    uninstall.add_argument("--dry-run", action="store_true", help="print what would be removed")
+    uninstall.add_argument("--yes", "-y", action="store_true")
+    uninstall.set_defaults(func=cmd_uninstall)
 
     rescale = subs.add_parser("rescale", help="fix recorded distance after a DPI correction")
     rescale.add_argument("--from", dest="frm", type=float, required=True,

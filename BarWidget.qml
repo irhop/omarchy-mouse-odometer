@@ -34,10 +34,6 @@ BarWidget {
   readonly property bool showNumber: setting("showNumber", true) !== false
   readonly property real goalMeters: Math.max(0, Number(setting("goalMeters", 0)) || 0)
   readonly property string icon: String(setting("icon", String.fromCodePoint(0xF037D)))
-  // Installing a user service on first load is convenient but opinionated;
-  // set autostart false and the panel's "Start tracker" button is the only
-  // thing that will ever touch systemd.
-  readonly property bool autostart: setting("autostart", true) !== false
   // Progress tracking is opinionated, so it stays off until asked for.
   readonly property bool gamify: setting("gamify", false) === true
   readonly property bool introSeen: setting("introSeen", false) === true
@@ -76,6 +72,11 @@ BarWidget {
     var updated = Date.parse(stats.updated)
     return isNaN(updated) ? true : (now.getTime() - updated) > 300000
   }
+  // No state file at all means the tracker was never set up, which is not the
+  // same as a tracker that has stopped: one wants consent, the other wants
+  // restarting. Until it is set up the widget shows nothing but its icon —
+  // a "0 m" nobody agreed to measure reads as a measurement.
+  readonly property bool setupNeeded: !stats
   readonly property bool overGoal: goalMeters > 0 && todayMeters > goalMeters
   readonly property bool improving: baselineMeters > 0 && todayMeters < baselineMeters
 
@@ -85,7 +86,7 @@ BarWidget {
   readonly property string deltaText: labelMode === "today" ? Format.deltaArrow(todayMeters, baselineMeters) : ""
 
   readonly property string tooltip: {
-    if (!stats) return "Mouse odometer: no data yet"
+    if (setupNeeded) return "Mouse odometer: not set up — click to see what it would install"
     if (stale) return "Mouse odometer: tracker not running"
     var parts = [Format.distance(todayMeters, units) + " today"]
     var delta = Format.deltaText(todayMeters, baselineMeters)
@@ -136,25 +137,12 @@ BarWidget {
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
-  // The tracker is a user service, so it outlives shell restarts and keeps
-  // counting while the widget is not even loaded. Bootstrapping it from here
-  // means installing the plugin is the only step a new user has to take.
-  function ensureTracker() {
-    if (!bar || bootstrapped || !autostart) return
-    bootstrapped = true
-    bar.run(root.shellQuote(Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", ""))
-            + " bootstrap >/dev/null 2>&1")
-  }
-
-  // Bars do not all expose shellQuote — the one shipped with 4.0.0.alpha
-  // documents it but does not define it, and calling it there threw before
-  // the tracker was ever installed. Quoting is three lines; owning them
-  // beats depending on the host for it.
-  function shellQuote(value) {
-    return "'" + String(value).replace(/'/g, "'\\''") + "'"
-  }
-
-  property bool bootstrapped: false
+  // The tracker is a user service, and installing one is not something a
+  // widget gets to decide. Enabling a plugin from the marketplace enables a
+  // *reader*: this file opens one JSON path and draws it. Every line that
+  // links a unit, writes a symlink or talks to systemd lives behind the
+  // panel's setup card, which shows what it would do and waits to be told.
+  // Nothing here runs it, and nothing runs it on load.
 
   // ---- panel plumbing (shape contract for shell summon/hide/toggle routing)
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
@@ -187,10 +175,7 @@ BarWidget {
     printErrors: false
     onFileChanged: root.stats = Format.parseState(text())
     onLoaded: root.stats = Format.parseState(text())
-    onLoadFailed: {
-      root.stats = null
-      root.ensureTracker()
-    }
+    onLoadFailed: root.stats = null
   }
 
   // The file is replaced by rename on every write, which an inotify watch on
@@ -266,7 +251,7 @@ BarWidget {
 
       Sparkline {
         id: spark
-        visible: root.graphMode !== "off" && root.graphValues.length > 0
+        visible: !root.setupNeeded && root.graphMode !== "off" && root.graphValues.length > 0
         anchors.verticalCenter: parent.verticalCenter
         width: visible ? implicitWidth : 0
         height: Math.round(root.barSize * 0.46)
@@ -278,7 +263,7 @@ BarWidget {
 
       Text {
         textFormat: Text.PlainText
-        visible: root.showNumber
+        visible: root.showNumber && !root.setupNeeded
         anchors.verticalCenter: parent.verticalCenter
         text: root.numberText
         color: button.active ? button.activeColor : button.foreground

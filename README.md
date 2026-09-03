@@ -52,17 +52,23 @@ reflects technique rather than how long you sat at the desk.
 omarchy plugin add https://github.com/irhop/omarchy-mouse-odometer.git --enable --yes
 ```
 
-The widget bootstraps its own tracker the first time it loads — installing the
-plugin is the only step. If you cloned it by hand instead:
+That installs a widget and nothing else. **Enabling the plugin does not
+install the tracker service** — the widget shows its icon and no number, and
+clicking it opens a panel that tells you what setting it up would change and
+waits for you to agree. Nothing touches systemd until you press the button.
+
+If you would rather do it from a terminal:
 
 ```bash
-~/.config/omarchy/plugins/io.github.irhop.mouse-odometer/install.sh
+cd ~/.config/omarchy/plugins/io.github.irhop.mouse-odometer
+bin/omarchy-mouse-odometer bootstrap --dry-run   # what it would change
+./install.sh                                     # do it, and put the widget on the bar
 ```
 
-### What it installs
+### What setting it up installs
 
 The widget is a reader; the measuring is done by a small user service, so it
-keeps counting when the shell restarts. On first load the widget runs
+keeps counting when the shell restarts. Confirming the panel's setup card runs
 `bin/omarchy-mouse-odometer bootstrap`, which:
 
 - symlinks `systemd/omarchy-mouse-odometer.service` into `~/.config/systemd/user/`
@@ -70,11 +76,18 @@ keeps counting when the shell restarts. On first load the widget runs
 - symlinks the CLI into `~/.local/bin/` if that directory exists
 - posts a desktop notification saying it has done so
 
+The card lists those in full before you agree to them, and it lists them by
+asking `bootstrap --dry-run` rather than from a description written here, so
+what you are shown is what will run. The result — including a failure — is
+reported back in the panel rather than swallowed.
+
 Nothing runs as root, nothing is written outside those paths plus its own
-state and config files, and no sudoers rule is touched. Set `autostart` to
-`false` on the widget if you would rather start the service yourself — the
-panel has a **Start tracker** button, and `install.sh` does the same job. To
-undo all of it, see [Uninstall](#uninstall).
+state and config files, and no sudoers rule is touched. The CLI is launched
+as an argv vector in an environment built from scratch, not as a shell string
+inheriting the compositor's, and every external command it runs (`systemctl`,
+`udevadm`, `ratbagctl`, the notifier) is resolved against a fixed
+`/usr/local/bin:/usr/bin:/bin` rather than an ambient `PATH`. To undo all of
+it, see [Uninstall](#uninstall).
 
 On a laptop, note that a Windows Precision Touchpad publishes two evdev nodes
 — the pad, and a relative "Mouse" collection kept for firmware older than the
@@ -190,7 +203,11 @@ omarchy-mouse-odometer status        # today / week / month / all time, with spa
 omarchy-mouse-odometer status -v     # per-device breakdown
 omarchy-mouse-odometer status --json # the raw state file
 omarchy-mouse-odometer devices       # which pointers are being watched
-omarchy-mouse-odometer bootstrap     # install and start the service
+omarchy-mouse-odometer bootstrap --dry-run   # what setting up would change
+omarchy-mouse-odometer bootstrap             # install and start the service
+omarchy-mouse-odometer uninstall --dry-run   # what removing it would take away
+omarchy-mouse-odometer uninstall             # remove the service and the links
+omarchy-mouse-odometer uninstall --purge     # ...and the recorded history
 omarchy-mouse-odometer reset --today
 omarchy-mouse-odometer reset --all
 ```
@@ -216,7 +233,6 @@ with `omarchy bar set`:
 | `showNumber` | `true` | Turn off for a graph-only widget |
 | `goalMeters` | `0` | Daily budget in metres; the widget turns urgent above it |
 | `gamify` | `false` | Baseline, streak and personal best in the panel, streak badge in the bar |
-| `autostart` | `true` | Install and start the tracker service on first load |
 | `icon` | `󰍽` | Glyph in front of the graph |
 
 ```json
@@ -313,10 +329,21 @@ nothing at install time.
 ## Uninstall
 
 ```bash
-systemctl --user disable --now omarchy-mouse-odometer.service
-rm ~/.config/systemd/user/omarchy-mouse-odometer.service ~/.local/bin/omarchy-mouse-odometer
+omarchy-mouse-odometer uninstall --dry-run   # exactly what will be removed
+omarchy-mouse-odometer uninstall             # service, unit link, CLI link
 omarchy plugin remove io.github.irhop.mouse-odometer
-rm -rf ~/.local/state/omarchy-mouse-odometer ~/.config/omarchy-mouse-odometer
 ```
+
+`uninstall` stops and disables the service and removes the two symlinks — but
+only if they still point back at this plugin; a same-named link to something
+else belongs to whoever made it. Your history and DPI settings are kept, so
+reinstalling picks up where you left off. To delete those too:
+
+```bash
+omarchy-mouse-odometer uninstall --purge
+```
+
+which additionally removes `~/.local/state/omarchy-mouse-odometer` and
+`~/.config/omarchy-mouse-odometer`.
 
 MIT licensed.

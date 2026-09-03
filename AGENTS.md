@@ -12,6 +12,25 @@
 
 ## Rules that matter
 
+- **Enabling the plugin installs nothing.** Loading a widget from a marketplace
+  must not link a unit, write a symlink or start a service. `bootstrap` is
+  reached from exactly two places, both of them a deliberate act: the panel's
+  setup card, after it has shown `bootstrap --dry-run` and been told to go
+  ahead, and `install.sh`. Nothing may call it on load, on first paint, or on
+  a failed state read. If a new entry point needs it, it needs a consent
+  screen first.
+- **The consent screen is generated, not written.** It lists what
+  `bootstrap_plan()` reports for this machine. Describing the same steps in
+  prose somewhere else is how the two drift apart.
+- **No shell strings, no ambient environment.** Every external command goes
+  through `run_tool()` (Python) or a `Process` with `clearEnvironment` (QML):
+  argv vectors, executables resolved against `SAFE_PATH`, and an environment
+  built from `ENV_KEEP` rather than inherited. A service installer reachable
+  from a bar widget must not pick up whatever `PATH` the compositor started
+  with.
+- **Anything installed must be removable.** `uninstall` reverses `bootstrap`
+  and only unlinks symlinks that still point back here. History and DPI
+  settings survive without `--purge`.
 - **The daemon is the only thing that touches `/dev/input`.** The QML side is a
   reader of one JSON file. Keep it that way: anything else would put evdev
   parsing inside the compositor's shell process.

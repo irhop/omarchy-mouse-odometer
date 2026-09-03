@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Format.js" as Format
@@ -16,13 +17,106 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
 
-  // The panel sits beside the CLI, so "Start tracker" bootstraps the same way
-  // the widget does. Calling systemctl directly assumed the unit was already
-  // linked, which on a machine that never bootstrapped is exactly the case
-  // the button exists to fix.
-  function trackerBin() {
-    var path = Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", "")
-    return "'" + path.replace(/'/g, "'\\''") + "'"
+  // This panel is the only place in the plugin that can install anything, and
+  // what it installs is a persistent user service. So the CLI is launched as
+  // an argv vector rather than a shell string, and in an environment built
+  // from scratch rather than whatever the compositor was started with: a
+  // service installer has no business inheriting an ambient PATH. The daemon
+  // rebuilds the same minimal environment again on its own side.
+  readonly property string trackerBin:
+    Qt.resolvedUrl("bin/omarchy-mouse-odometer").toString().replace("file://", "")
+
+  function trackerEnvironment() {
+    var env = { "PATH": "/usr/local/bin:/usr/bin:/bin" }
+    // XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are how `systemctl --user`
+    // reaches the session manager; the rest keep the child's idea of where
+    // config and state live identical to this widget's.
+    var keep = ["HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                "XDG_CONFIG_HOME", "XDG_STATE_HOME", "WAYLAND_DISPLAY"]
+    for (var i = 0; i < keep.length; i++) {
+      var value = Quickshell.env(keep[i])
+      if (value) env[keep[i]] = value
+    }
+    return env
+  }
+
+  function splitLines(text) {
+    var lines = []
+    var raw = String(text || "").split("\n")
+    for (var i = 0; i < raw.length; i++) if (raw[i].trim() !== "") lines.push(raw[i].trim())
+    return lines
+  }
+
+  // ---- setup: idle -> probing -> review -> running -> done | failed
+  property string setupStage: "idle"
+  property var setupScope: []
+  property string setupReport: ""
+  property string probeOutput: ""
+  property string runOutput: ""
+  property string runError: ""
+
+  function reviewSetup() {
+    setupScope = []
+    setupReport = ""
+    setupStage = "probing"
+    scopeProbe.running = true
+  }
+
+  function confirmSetup() {
+    setupStage = "running"
+    setupProcess.running = true
+  }
+
+  // A tracker that starts writing again is the card's job done; reset so that
+  // a later stall offers setup rather than last week's success message.
+  onStaleChanged: if (!stale) { setupStage = "idle"; setupReport = ""; setupScope = [] }
+
+  // Asking the installer what it would do, rather than describing it here,
+  // is what keeps the consent screen and the installer from drifting apart.
+  Process {
+    id: scopeProbe
+    clearEnvironment: true
+    environment: root.trackerEnvironment()
+    command: [root.trackerBin, "bootstrap", "--dry-run"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.probeOutput = text }
+    onExited: function(exitCode) {
+      var lines = root.splitLines(root.probeOutput)
+      root.probeOutput = ""
+      if (exitCode !== 0 || lines.length === 0) {
+        root.setupStage = "failed"
+        root.setupReport = "Could not read the setup plan from the tracker CLI (exit "
+                           + exitCode + "). Nothing has been changed."
+        return
+      }
+      root.setupScope = lines
+      root.setupStage = "review"
+    }
+  }
+
+  // The only call in the plugin that changes service state, and its output is
+  // reported rather than discarded: an installer whose result nobody reads is
+  // indistinguishable from one that silently did nothing.
+  Process {
+    id: setupProcess
+    clearEnvironment: true
+    environment: root.trackerEnvironment()
+    command: [root.trackerBin, "bootstrap"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.runOutput = text }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.runError = text }
+    onExited: function(exitCode) {
+      var report = (root.runOutput + "\n" + root.runError).trim()
+      root.runOutput = ""
+      root.runError = ""
+      if (exitCode === 0) {
+        root.setupStage = "done"
+        root.setupReport = report !== "" ? report : "Tracker installed and running."
+      } else {
+        root.setupStage = "failed"
+        root.setupReport = (report !== "" ? report + "\n" : "")
+                           + "Setup failed (exit " + exitCode + ")."
+      }
+      if (root.hostWidget) Qt.callLater(root.hostWidget.reload)
+    }
   }
   readonly property var barIdentity: hostWidget || root
 
@@ -130,6 +224,167 @@ Panel {
         id: column
         width: panelFlick.width
         spacing: Style.space(12)
+
+        // ---------- Setup, which only ever happens on purpose ----------
+        //
+        // Enabling a plugin must not install a service. Nothing in this
+        // plugin touches systemd, writes a symlink or enables a unit until
+        // someone has read the list below and pressed the button under it.
+        Column {
+          id: setupCard
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.stale
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.hasData
+              ? "The tracker has not written anything for a while — the numbers below are frozen."
+              : "Nothing is being measured yet."
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            visible: !root.hasData
+            text: "This widget only reads a file. The measuring is done by a small "
+                  + "user service, which is not installed until you ask for it here."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            visible: root.setupStage === "idle"
+            text: root.hasData ? "Start tracker…" : "Set up tracker…"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.reviewSetup()
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            visible: root.setupStage === "probing"
+            text: "Working out what it would change…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // ---- what it would do, asked of the installer itself
+          Column {
+            id: scopeList
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.setupStage === "review"
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Setting up will:"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Repeater {
+              model: root.setupScope
+
+              Text {
+                width: scopeList.width
+                textFormat: Text.PlainText
+                text: "•  " + modelData
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "No root, no sudo, no network. Reading the mouse also needs your "
+                    + "account to be in the 'input' group — that is yours to grant, "
+                    + "and nothing here changes it for you."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              spacing: Style.space(8)
+
+              Button {
+                text: "Cancel"
+                bordered: true
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.setupStage = "idle"
+              }
+
+              Button {
+                text: "Install and start"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.confirmSetup()
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            visible: root.setupStage === "running"
+            text: "Setting up…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // ---- and what actually happened
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.setupStage === "done" || root.setupStage === "failed"
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.setupReport
+              color: root.setupStage === "failed" ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              visible: root.setupStage === "failed"
+              text: "Try again"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: root.reviewSetup()
+            }
+          }
+        }
 
         // ---------- First run: what this is actually for ----------
         Column {
@@ -635,36 +890,6 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        // ---------- The tracker is not running ----------
-        Column {
-          width: parent.width
-          spacing: Style.space(8)
-          visible: root.stale
-
-          Text {
-            width: parent.width
-            textFormat: Text.PlainText
-            text: root.hasData
-              ? "The tracker has not written anything for a while — the numbers above are frozen."
-              : "No measurements yet. The tracker service is what reads the mouse."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Button {
-            text: "Start tracker"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onClicked: {
-              if (root.bar) root.bar.run(root.trackerBin() + " bootstrap")
-              if (root.hostWidget) Qt.callLater(root.hostWidget.reload)
-            }
-          }
-        }
       }
       }
     }
