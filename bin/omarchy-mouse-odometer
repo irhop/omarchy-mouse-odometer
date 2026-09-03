@@ -317,7 +317,7 @@ def load_config():
 
 
 def save_config(config):
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(CONFIG_PATH), mode=0o700, exist_ok=True)
     write_atomic(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
 
 
@@ -450,11 +450,19 @@ def load_state():
 
 
 def write_atomic(path, text):
+    """Replace a file in one step, readable only by its owner.
+
+    A minute-by-minute log of when someone was at their desk is nobody
+    else's business, so neither of the two files this writes is world
+    readable. os.replace carries the temp file's mode across, which also
+    tightens a file first written by an older version.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w") as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -484,7 +492,7 @@ def save_state(state):
     payload["days"] = {day: rounded(bucket) for day, bucket in sorted(days.items())}
     payload["devices"] = {name: rounded(bucket) for name, bucket in (state.get("devices") or {}).items()}
 
-    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     write_atomic(STATE_PATH, json.dumps(payload, separators=(",", ":")) + "\n")
 
 
