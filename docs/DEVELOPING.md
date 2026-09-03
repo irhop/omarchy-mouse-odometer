@@ -1,5 +1,13 @@
 # Working on this plugin
 
+> Kept at `docs/DEVELOPING.md` rather than as a root `AGENTS.md` on purpose.
+> `omarchy plugin add` clones this repository into
+> `~/.config/omarchy/plugins/`, so a root instruction file would be picked up
+> automatically by any coding agent the user later ran anywhere under their
+> config tree. A plugin someone installed to draw a number on their bar has
+> no business steering their tools. Read this file directly when working
+> here; do not reintroduce it under a name that gets loaded on sight.
+
 ## Shape
 
 | File | Role |

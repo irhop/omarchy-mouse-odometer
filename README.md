@@ -346,4 +346,6 @@ omarchy-mouse-odometer uninstall --purge
 which additionally removes `~/.local/state/omarchy-mouse-odometer` and
 `~/.config/omarchy-mouse-odometer`.
 
+Development notes are in [`docs/DEVELOPING.md`](docs/DEVELOPING.md).
+
 MIT licensed.

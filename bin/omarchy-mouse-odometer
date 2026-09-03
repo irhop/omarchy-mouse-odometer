@@ -28,6 +28,7 @@ import os
 import select
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -78,6 +79,7 @@ UNIT_NAME = "omarchy-mouse-odometer.service"
 HOURLY_KEEP_DAYS = 7     # hour-by-hour detail is a recent-history luxury
 SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
 STATE_VERSION = 1
+TMP_ATTEMPTS = 8         # a random leaf collides essentially never; bound it anyway
 
 HOME = os.path.expanduser("~")
 STATE_DIR = os.environ.get("OMARCHY_MOUSE_ODOMETER_STATE") or os.path.join(
@@ -100,6 +102,18 @@ CONFIG_PATH = os.path.join(
 # need are carried across.
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 
+# Every command here is a local query or a systemctl call: quick, or wedged.
+# A tracker must never sit forever on a child that is not coming back, and it
+# must never buffer an unbounded reply into memory just to parse a number out
+# of the first lines of it.
+TOOL_TIMEOUT = 20.0
+TOOL_KILL_GRACE = 2.0
+TOOL_OUTPUT_LIMIT = 64 * 1024
+TOOL_READ_CHUNK = 64 * 1024
+TOOL_MISSING = 127        # conventional "command not found"
+TOOL_TIMED_OUT = 124      # conventional "killed by timeout"
+TOOL_TOO_MUCH = 125       # said more than any of these commands has to say
+
 # XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are how `systemctl --user`
 # finds the session manager. Without them it has nothing to talk to.
 ENV_KEEP = ("HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
@@ -120,6 +134,21 @@ def minimal_env():
     return env
 
 
+def reap(child):
+    """Make sure a child we are finished with is actually gone.
+
+    Ask, wait, then insist. Returning while it still runs would leave the
+    daemon holding a pipe on a process nobody is going to read again.
+    """
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=TOOL_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            child.kill()
+    return child.wait()
+
+
 def run_tool(name, args, keep_stderr=True):
     """Run one external tool by absolute path, no shell, minimal environment.
 
@@ -128,19 +157,54 @@ def run_tool(name, args, keep_stderr=True):
     `keep_stderr` folds the error stream into the output, which is what makes
     a failed systemctl reportable; the DPI probes turn it off so that a
     diagnostic can never be mistaken for a reading.
+
+    The output is read incrementally against a deadline and a byte cap, and
+    the child is torn down on every exit from this function. Collecting the
+    whole reply first and trimming it afterwards is not a cap: a command that
+    floods its output would sit in memory until the deadline, having been
+    read in full precisely because nobody wanted it.
     """
     binary = tool_path(name)
     if not binary:
-        return 127, ""
+        return TOOL_MISSING, ""
     try:
-        done = subprocess.run(
+        child = subprocess.Popen(
             [binary] + list(args), env=minimal_env(), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT if keep_stderr else subprocess.DEVNULL,
-            universal_newlines=True)
+            stderr=subprocess.STDOUT if keep_stderr else subprocess.DEVNULL)
     except OSError:
-        return 127, ""
-    return done.returncode, done.stdout or ""
+        return TOOL_MISSING, ""
+
+    deadline = time.monotonic() + TOOL_TIMEOUT
+    chunks, size, verdict = [], 0, None
+    try:
+        handle = child.stdout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                verdict = TOOL_TIMED_OUT
+                break
+            if not select.select([handle], [], [], min(remaining, 0.25))[0]:
+                continue
+            chunk = os.read(handle.fileno(), TOOL_READ_CHUNK)
+            if not chunk:
+                break                                  # the child closed its output
+            room = TOOL_OUTPUT_LIMIT - size
+            if room > 0:
+                chunks.append(chunk[:room])
+                size += min(len(chunk), room)
+            if size >= TOOL_OUTPUT_LIMIT:
+                verdict = TOOL_TOO_MUCH
+                break
+    finally:
+        child.stdout.close()
+        status = reap(child)
+
+    if verdict == TOOL_TIMED_OUT:
+        return verdict, "%s did not finish within %gs" % (name, TOOL_TIMEOUT)
+    if verdict == TOOL_TOO_MUCH:
+        return verdict, "%s produced more than %d bytes" % (name, TOOL_OUTPUT_LIMIT)
+    return status, b"".join(chunks).decode("utf-8", "replace")
 
 
 def systemctl(*args):
@@ -317,7 +381,6 @@ def load_config():
 
 
 def save_config(config):
-    os.makedirs(os.path.dirname(CONFIG_PATH), mode=0o700, exist_ok=True)
     write_atomic(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
 
 
@@ -449,21 +512,70 @@ def load_state():
     return state
 
 
+def private_dir_fd(directory):
+    """Open a directory this account owns, and hold it open.
+
+    Every later step works relative to the descriptor rather than the name,
+    so no part of the path can be swapped for a symlink between the check and
+    the write. O_NOFOLLOW refuses a directory that is itself a link, the uid
+    check refuses one somebody else owns, and a directory left group- or
+    world-writable by an older version is tightened through the descriptor
+    rather than by a second lookup of the same name.
+    """
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid():
+            raise OSError(errno.EPERM, "%s is not owned by this account" % directory)
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            os.fchmod(fd, 0o700)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def write_atomic(path, text):
     """Replace a file in one step, readable only by its owner.
 
-    A minute-by-minute log of when someone was at their desk is nobody
-    else's business, so neither of the two files this writes is world
-    readable. os.replace carries the temp file's mode across, which also
-    tightens a file first written by an older version.
+    A minute-by-minute record of when someone was at their desk is nobody
+    else's business, so neither file this writes is readable by anyone but
+    its owner. The temp file gets a random name created with O_EXCL, so it
+    cannot be lying in wait as a symlink pointing at something worth
+    truncating, and it is created and renamed relative to a held descriptor
+    for a directory that has been verified private.
     """
-    tmp = path + ".tmp"
-    with open(tmp, "w") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    directory, leaf = os.path.split(path)
+    dir_fd = private_dir_fd(directory)
+    try:
+        for _ in range(TMP_ATTEMPTS):
+            tmp = ".%s.%s" % (leaf, os.urandom(8).hex())
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise OSError(errno.EEXIST, "no free temporary name in %s" % directory)
+
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Replacing the name rather than writing through it means a
+            # symlink left at `path` is overwritten, never followed.
+            os.replace(tmp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
 
 
 def save_state(state):
@@ -492,7 +604,6 @@ def save_state(state):
     payload["days"] = {day: rounded(bucket) for day, bucket in sorted(days.items())}
     payload["devices"] = {name: rounded(bucket) for name, bucket in (state.get("devices") or {}).items()}
 
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     write_atomic(STATE_PATH, json.dumps(payload, separators=(",", ":")) + "\n")
 
 

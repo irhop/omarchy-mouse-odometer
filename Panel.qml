@@ -55,21 +55,74 @@ Panel {
   property string runOutput: ""
   property string runError: ""
 
+  // Set the moment we stop caring about a child, so its late `exited` cannot
+  // reach back and rewrite a card the user has already moved on from.
+  property bool setupAbandoned: false
+
+  // One deadline covers both steps. A child that never returns must not leave
+  // this card reading "Setting up…" for the rest of the session.
+  readonly property int setupTimeout: 30000
+
+  // The collectors buffer whatever they are handed. The child is this
+  // plugin's own CLI, which prints a few lines and is killed at the deadline,
+  // but keep only as much as the card could ever render.
+  readonly property int outputLimit: 16384
+
+  function clamp(text) {
+    var value = String(text || "")
+    return value.length > outputLimit ? value.slice(0, outputLimit) + "\n…(truncated)" : value
+  }
+
+  Timer {
+    id: setupWatchdog
+    interval: root.setupTimeout
+    repeat: false
+    onTriggered: root.abandonSetup("did not finish within "
+                                   + Math.round(root.setupTimeout / 1000) + " seconds")
+  }
+
+  // Ask both children to stop and stop listening to them. Safe to call when
+  // nothing is running, which is what makes it usable from teardown.
+  function stopSetup() {
+    setupWatchdog.stop()
+    setupAbandoned = true
+    if (scopeProbe.running) { scopeProbe.signal(15); scopeProbe.running = false }
+    if (setupProcess.running) { setupProcess.signal(15); setupProcess.running = false }
+  }
+
+  function abandonSetup(why) {
+    stopSetup()
+    setupStage = "failed"
+    setupReport = "Setup " + why + " and was stopped. Nothing further was changed."
+  }
+
   function reviewSetup() {
+    if (setupStage === "probing" || setupStage === "running") return
     setupScope = []
     setupReport = ""
+    probeOutput = ""
+    setupAbandoned = false
     setupStage = "probing"
+    setupWatchdog.restart()
     scopeProbe.running = true
   }
 
   function confirmSetup() {
+    if (setupStage !== "review") return
+    runOutput = ""
+    runError = ""
+    setupAbandoned = false
     setupStage = "running"
+    setupWatchdog.restart()
     setupProcess.running = true
   }
 
   // A tracker that starts writing again is the card's job done; reset so that
   // a later stall offers setup rather than last week's success message.
-  onStaleChanged: if (!stale) { setupStage = "idle"; setupReport = ""; setupScope = [] }
+  onStaleChanged: if (!stale) { stopSetup(); setupStage = "idle"; setupReport = ""; setupScope = [] }
+
+  // A panel that goes away takes its children with it.
+  Component.onDestruction: stopSetup()
 
   // Asking the installer what it would do, rather than describing it here,
   // is what keeps the consent screen and the installer from drifting apart.
@@ -78,8 +131,10 @@ Panel {
     clearEnvironment: true
     environment: root.trackerEnvironment()
     command: [root.trackerBin, "bootstrap", "--dry-run"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.probeOutput = text }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.probeOutput = root.clamp(text) }
     onExited: function(exitCode) {
+      setupWatchdog.stop()
+      if (root.setupAbandoned) return
       var lines = root.splitLines(root.probeOutput)
       root.probeOutput = ""
       if (exitCode !== 0 || lines.length === 0) {
@@ -101,10 +156,12 @@ Panel {
     clearEnvironment: true
     environment: root.trackerEnvironment()
     command: [root.trackerBin, "bootstrap"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.runOutput = text }
-    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.runError = text }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.runOutput = root.clamp(text) }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.runError = root.clamp(text) }
     onExited: function(exitCode) {
-      var report = (root.runOutput + "\n" + root.runError).trim()
+      setupWatchdog.stop()
+      if (root.setupAbandoned) return
+      var report = root.clamp((root.runOutput + "\n" + root.runError).trim())
       root.runOutput = ""
       root.runError = ""
       if (exitCode === 0) {
