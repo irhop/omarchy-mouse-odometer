@@ -318,9 +318,12 @@ nothing at install time.
 
 ## Limitations
 
-- **Touchpads are not counted.** They report absolute positions, not relative
-  counts, so there is no DPI to divide by. External mice, trackballs and
-  trackpoints all work.
+- **A touchpad measures the finger, not the hand.** The pad reports absolute
+  positions, which are turned into the deltas a mouse would have sent at the
+  resolution the pad itself reports — so a laptop needs no calibration, but
+  only the primary finger contributes, and a finger lifting and landing
+  elsewhere adds nothing. Mice, trackballs and trackpoints are read as the
+  relative counts they send.
 - **DPI switching on the fly** (the button some mice have) is invisible to the
   kernel, so distance recorded at another DPI setting is off by that ratio.
 - The daemon starts with your user session, so movement before login or while
